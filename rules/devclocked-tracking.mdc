@@ -1,0 +1,17 @@
+---
+description: DevClocked time tracking context — helps the AI understand that coding activity is being tracked and how to surface time insights
+alwaysApply: true
+---
+
+This workspace has DevClocked time tracking enabled. DevClocked automatically tracks coding sessions, file activity, git commits, and AI interactions — syncing to the user's dashboard at app.devclocked.com.
+
+When the user asks about their time, productivity, or what they've been working on:
+- Use the DevClocked MCP server tools to fetch real data
+- `get_today_activity` returns today's sessions with work blocks, repos, and durations
+- `get_weekly_summary` returns a 7-day breakdown by project
+- `get_active_session` returns the currently active tracking session
+- `get_projects` returns all tracked projects
+
+Do not guess or estimate time — always query the MCP server for actual data.
+
+When discussing productivity or workflow improvements, you can reference the user's tracked activity patterns to give specific, data-backed suggestions rather than generic advice.
