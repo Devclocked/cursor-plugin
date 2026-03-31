@@ -13,20 +13,25 @@ description: Review coding time and session stats. Use when the user asks about 
 
 ## Instructions
 
-1. Use the DevClocked MCP server to fetch real tracking data:
-   - Call `get_today_activity` for today's sessions and work blocks
-   - Call `get_active_session` to check if tracking is currently active
-   - Call `get_weekly_summary` for a broader view
+1. **Always call `get_summary` first** — it returns a pre-formatted dashboard with progress bars, repo breakdowns, and stats in a visual box layout. Display this output directly in a code block:
 
-2. Present the data clearly:
-   - Show total time tracked today
-   - Break down by project/repo if multiple
-   - Mention the current active session if there is one
-   - Note any gaps or idle periods if relevant
+   ```
+   ╭────────────────────────────────────────────────────────╮
+   │ ◉ repo-name  ████████░░░░░░░░░░░░  45m  ● Tracking   │
+   │  Today: 2h 15m · 3 repos · 5 blocks · +120/-34 · 2k tok │
+   ├────────────────────────────────────────────────────────┤
+   │  project-a               ████████████████████  1h 20m │
+   │  project-b               ████████░░░░░░░░░░░    35m  │
+   │  project-c               ███░░░░░░░░░░░░░░░░░    20m  │
+   ╰────────────────────────────────────────────────────────╯
+   ```
 
-3. Keep it conversational — don't dump raw JSON. Summarize the key points:
-   - "You've been coding for 3h 42m today across 2 projects"
-   - "Most of your time went to devclocked-trackers (2h 15m)"
-   - "You've been in this session for 47 minutes"
+2. **Display the `get_summary` output as-is** inside a code block. Do not reformat it, summarize it, or convert it to bullet points. The formatted dashboard IS the response.
 
-4. If no data is available, suggest the user run `npx devclocked setup` to configure tracking.
+3. Only call `get_today_activity` (raw JSON) if the user asks for specific details not in the summary (e.g., exact session start times, individual work block details, or token counts per block).
+
+4. For weekly views, call `get_weekly_summary` which also returns pre-formatted text. Display it in a code block.
+
+5. You can add a brief one-line comment before or after the dashboard if relevant (e.g., "You're on a good streak today!" or "Looks like a quiet morning"), but the dashboard itself should be shown unmodified.
+
+6. If no data is available, suggest the user run `npx devclocked setup` to configure tracking.
