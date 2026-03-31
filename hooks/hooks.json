@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "node ./hooks/track.js",
+        "type": "command",
+        "timeout": 10
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "node ./hooks/track.js",
+        "type": "command",
+        "timeout": 10
+      }
+    ],
+    "afterFileEdit": [
+      {
+        "command": "node ./hooks/track.js",
+        "type": "command",
+        "timeout": 10
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "node ./hooks/track.js",
+        "type": "command",
+        "timeout": 10
+      }
+    ],
+    "afterShellExecution": [
+      {
+        "command": "node ./hooks/track.js",
+        "type": "command",
+        "timeout": 10
+      }
+    ],
+    "subagentStart": [
+      {
+        "command": "node ./hooks/track.js",
+        "type": "command",
+        "timeout": 10
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "node ./hooks/track.js",
+        "type": "command",
+        "timeout": 10
+      }
+    ]
+  }
+}

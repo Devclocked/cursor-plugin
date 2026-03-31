@@ -1,13 +1,13 @@
 {
   "name": "devclocked",
   "description": "Automatic time tracking for developers. See where your dev hours go across Cursor, VS Code, Claude Code, and Chrome.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": {
     "name": "DevClocked",
     "email": "support@devclocked.com"
   },
   "homepage": "https://devclocked.com",
-  "repository": "https://github.com/devclocked/trackers",
+  "repository": "https://github.com/Devclocked/cursor-plugin",
   "license": "MIT",
   "keywords": [
     "time-tracking",
@@ -15,8 +15,10 @@
     "developer-tools",
     "analytics",
     "cursor",
+    "cursor-glass",
     "claude-code",
     "devclocked"
   ],
-  "logo": "assets/logo.png"
+  "logo": "assets/logo.png",
+  "hooks": "hooks/hooks.json"
 }
