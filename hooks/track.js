@@ -110,6 +110,7 @@ function callEdgeFunction(apiKey, fnName, body) {
           'apikey': SUPABASE_ANON_KEY,
           'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
           'x-devclocked-key': apiKey,
+          'x-devclocked-source': 'cursor-plugin',
           'Content-Length': Buffer.byteLength(data),
         },
         timeout: 10_000,
@@ -294,83 +295,80 @@ function classifyActivity(hookEvent, input) {
 
 // --- Tick Builder ---
 
-function buildTick(hookEvent, input, stream, repo) {
-  const { activity_type, sub_type } = classifyActivity(hookEvent, input);
+/**
+ * Build a TrackTickRequest payload that matches the backend's expected format:
+ * { ticks: [{ entity, entity_type, timestamp, branch?, project_name?, ... }] }
+ *
+ * The x-devclocked-source header handles source attribution separately.
+ */
+function buildTrackTickRequest(hookEvent, input, stream, repo) {
+  const now = new Date().toISOString();
 
+  // Determine entity (what was acted on) and entity_type
+  let entity = `cursor://${hookEvent}`;
+  let entityType = 'window';
+  let isWrite = false;
+  let linesAdded = 0;
+  let linesDeleted = 0;
+
+  if (hookEvent === 'afterFileEdit' && input.file_path) {
+    entity = input.file_path;
+    entityType = 'file';
+    isWrite = true;
+    for (const edit of input.edits || []) {
+      linesAdded += (edit.new_string || '').split('\n').length;
+      linesDeleted += (edit.old_string || '').split('\n').length;
+    }
+  } else if (hookEvent === 'postToolUse') {
+    const toolName = input.tool_name || 'unknown';
+    if (toolName === 'Write' && input.tool_input?.file_path) {
+      entity = input.tool_input.file_path;
+      entityType = 'file';
+      isWrite = true;
+    } else if (toolName === 'Read' && input.tool_input?.file_path) {
+      entity = input.tool_input.file_path;
+      entityType = 'file';
+      isWrite = false;
+    } else {
+      entity = `cursor://tool/${toolName}`;
+      entityType = 'window';
+    }
+  } else if (hookEvent === 'afterShellExecution' && input.command) {
+    entity = `cursor://shell/${input.command.split(/\s/)[0]}`;
+    entityType = 'window';
+    isWrite = true;
+  } else if (hookEvent === 'subagentStart' || hookEvent === 'subagentStop') {
+    const agentType = input.subagent_type || stream.subagentType || 'agent';
+    entity = `cursor://agent/${agentType}/${stream.streamId}`;
+    entityType = 'window';
+  } else if (hookEvent === 'sessionStart' || hookEvent === 'sessionEnd') {
+    entity = `cursor://session/${stream.streamId}`;
+    entityType = 'window';
+  }
+
+  // Build the tick in the format track-tick expects
   const tick = {
-    source: 'cursor-plugin',
-    device_name: 'cursor',
-    activity_type,
-    metadata: {
-      hook_event: hookEvent,
-      sub_type,
-
-      // Stream identity
-      stream_id: stream.streamId,
-      parent_stream_id: stream.parentStreamId,
-      is_subagent: stream.isSubagent,
-      is_parallel: stream.isParallel,
-      subagent_type: stream.subagentType,
-
-      // Repo/project attribution
-      repo_name: repo.repo_name,
-      git_branch: repo.branch || stream.gitBranch,
-
-      // Context
-      model: input.model || null,
-      user_email: input.user_email || null,
-    },
+    entity,
+    entity_type: entityType,
+    timestamp: now,
+    is_write: isWrite,
+    project_name: repo.repo_name || undefined,
+    branch: repo.branch || stream.gitBranch || undefined,
+    code_lines_added: linesAdded || undefined,
+    code_lines_deleted: linesDeleted || undefined,
   };
 
-  // File edit details
-  if (hookEvent === 'afterFileEdit' && input.file_path) {
-    tick.metadata.file_path = input.file_path;
-    tick.metadata.lines_added = 0;
-    tick.metadata.lines_removed = 0;
-    for (const edit of input.edits || []) {
-      tick.metadata.lines_added += (edit.new_string || '').split('\n').length;
-      tick.metadata.lines_removed += (edit.old_string || '').split('\n').length;
-    }
+  // Build the full request payload
+  const request = {
+    ticks: [tick],
+  };
+
+  // Add workspace fingerprint if available
+  if (input.workspace_roots && input.workspace_roots[0]) {
+    request.workspace_fingerprint = input.workspace_roots[0];
   }
 
-  // Tool use details
-  if (hookEvent === 'postToolUse') {
-    tick.metadata.tool_name = input.tool_name;
-    tick.metadata.duration_ms = input.duration;
-  }
-
-  // Shell command (name only for privacy)
-  if (hookEvent === 'afterShellExecution' && input.command) {
-    tick.metadata.command_name = input.command.split(/\s/)[0];
-    tick.metadata.duration_ms = input.duration;
-  }
-
-  // Subagent start — full context for stream creation
-  if (hookEvent === 'subagentStart') {
-    tick.metadata.task_description = (input.task || '').slice(0, 200);
-    tick.metadata.subagent_model = input.subagent_model || null;
-  }
-
-  // Subagent stop — summary metrics for stream completion
-  if (hookEvent === 'subagentStop') {
-    tick.metadata.status = input.status;
-    tick.metadata.duration_ms = input.duration_ms;
-    tick.metadata.tool_call_count = input.tool_call_count;
-    tick.metadata.message_count = input.message_count;
-    tick.metadata.loop_count = input.loop_count;
-    tick.metadata.modified_files_count = (input.modified_files || []).length;
-    // Include file list (truncated) for repo attribution
-    tick.metadata.modified_files = (input.modified_files || []).slice(0, 20);
-  }
-
-  // Session end
-  if (hookEvent === 'sessionEnd') {
-    tick.metadata.reason = input.reason;
-    tick.metadata.duration_ms = input.duration_ms;
-    tick.metadata.is_background_agent = input.is_background_agent;
-  }
-
-  return tick;
+  return request;
 }
 
 // --- Main ---
@@ -440,11 +438,11 @@ async function main() {
   // Resolve repo/project attribution
   const repo = resolveRepo(input, stream);
 
-  // Build and send tick
-  const tick = buildTick(hookEvent, input, stream, repo);
+  // Build and send tick in track-tick API format
+  const payload = buildTrackTickRequest(hookEvent, input, stream, repo);
 
   try {
-    await callEdgeFunction(apiKey, 'track-tick', tick);
+    await callEdgeFunction(apiKey, 'track-tick', payload);
 
     // Update throttle state for this stream
     const state = getStreamState(stream.streamId) || {};
