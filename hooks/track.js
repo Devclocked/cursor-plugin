@@ -24,9 +24,10 @@ const https = require('https');
 
 // --- Config ---
 
-const SUPABASE_URL = 'https://jboeqjaosyfqnxlnpvxl.supabase.co';
+// Keep aligned with cli/src/config.ts and daemon/src/config.ts
+const SUPABASE_URL = 'https://haqfgkkmeglyrulmpist.supabase.co';
 const SUPABASE_ANON_KEY =
-  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Impib2VxamFvc3lmcW54bG5wdnhsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzgzMjM2OTYsImV4cCI6MjA1Mzg5OTY5Nn0.59FDUFjXJiFGuxObjHMqNKkMK8JGZOqfuKB2MjM0Iy4';
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhhcWZna2ttZWdseXJ1bG1waXN0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTIwMDYyODcsImV4cCI6MjA2NzU4MjI4N30.fTonLdDRqqtV44tBcl0Z7ryvaSD5Gczy-OTkzHUw0o4';
 const CLI_CONFIG_PATH = path.join(
   process.env.HOME || '~',
   '.config',
@@ -151,9 +152,18 @@ function resolveStream(hookEvent, input) {
 
   // For subagentStart, the stream is the NEW subagent being created
   if (hookEvent === 'subagentStart') {
+    const parentState = input.parent_conversation_id
+      ? getStreamState(input.parent_conversation_id)
+      : null;
+    const rootStreamId =
+      parentState?.root_stream_id ||
+      input.parent_conversation_id ||
+      input.subagent_id ||
+      streamId;
     return {
       streamId: input.subagent_id || streamId,
       parentStreamId: input.parent_conversation_id || null,
+      rootStreamId,
       isSubagent: true,
       isParallel: input.is_parallel_worker || false,
       subagentType: input.subagent_type || null,
@@ -164,9 +174,11 @@ function resolveStream(hookEvent, input) {
 
   // For subagentStop, the stream is the subagent that just finished
   if (hookEvent === 'subagentStop') {
+    const existing = getStreamState(input.subagent_id || streamId);
     return {
       streamId: input.subagent_id || streamId,
       parentStreamId: input.parent_conversation_id || null,
+      rootStreamId: existing?.root_stream_id || input.parent_conversation_id || input.subagent_id || streamId,
       isSubagent: true,
       isParallel: false,
       subagentType: input.subagent_type || null,
@@ -177,9 +189,11 @@ function resolveStream(hookEvent, input) {
 
   // For sessionStart/sessionEnd, this is the root conversation
   if (hookEvent === 'sessionStart' || hookEvent === 'sessionEnd') {
+    const rootId = input.session_id || streamId;
     return {
-      streamId: input.session_id || streamId,
+      streamId: rootId,
       parentStreamId: null,
+      rootStreamId: rootId,
       isSubagent: false,
       isParallel: false,
       subagentType: null,
@@ -196,6 +210,7 @@ function resolveStream(hookEvent, input) {
   return {
     streamId,
     parentStreamId: existingState?.parent_stream_id || null,
+    rootStreamId: existingState?.root_stream_id || streamId,
     isSubagent: existingState?.is_subagent || false,
     isParallel: existingState?.is_parallel || false,
     subagentType: existingState?.subagent_type || null,
@@ -346,6 +361,18 @@ function buildTrackTickRequest(hookEvent, input, stream, repo) {
     entityType = 'window';
   }
 
+  const activity = classifyActivity(hookEvent, input);
+  const workSignature = {
+    read_count: activity.activity_type === 'reading' ? 1 : 0,
+    write_count: isWrite ? 1 : 0,
+    exec_count: activity.sub_type === 'shell' ? 1 : 0,
+    plan_count: activity.activity_type === 'planning' ? 1 : 0,
+    total_turns: 1,
+  };
+  const runtimeMs = 5_000;
+  const runtimeEndedAt = new Date(new Date(now).getTime() + runtimeMs).toISOString();
+  const runId = `cursor:${stream.rootStreamId || stream.streamId}`;
+
   // Build the tick in the format track-tick expects
   const tick = {
     entity,
@@ -356,6 +383,29 @@ function buildTrackTickRequest(hookEvent, input, stream, repo) {
     branch: repo.branch || stream.gitBranch || undefined,
     code_lines_added: linesAdded || undefined,
     code_lines_deleted: linesDeleted || undefined,
+    activity_context: {
+      ai_tool: {
+        tool: 'cursor',
+        activity_type: activity.activity_type,
+        work_signature: workSignature,
+        summary: `Cursor ${activity.sub_type}`,
+        timestamp: now,
+        session_file_id: input.session_id || input.conversation_id || undefined,
+        run_id: runId,
+        request_key: `${runId}:${hookEvent}:${now}`,
+        runtime_ms: runtimeMs,
+        runtime_started_at: now,
+        runtime_ended_at: runtimeEndedAt,
+        measurement_quality: 'estimated',
+        is_sidechain: Boolean(stream.parentStreamId),
+        stream_id: stream.streamId,
+        parent_stream_id: stream.parentStreamId || undefined,
+        root_stream_id: stream.rootStreamId || stream.streamId,
+        stream_role: stream.parentStreamId ? 'sidechain' : 'primary',
+        agent_id: stream.isSubagent ? stream.streamId : undefined,
+        ai_tool_version: 1,
+      },
+    },
   };
 
   // Build the full request payload
@@ -406,6 +456,7 @@ async function main() {
       last_tick_at: null,
       is_subagent: false,
       parent_stream_id: null,
+      root_stream_id: stream.streamId,
       is_parallel: false,
       subagent_type: null,
       git_branch: null,
@@ -420,6 +471,7 @@ async function main() {
       last_tick_at: null,
       is_subagent: true,
       parent_stream_id: stream.parentStreamId,
+      root_stream_id: stream.rootStreamId || stream.parentStreamId || stream.streamId,
       is_parallel: stream.isParallel,
       subagent_type: stream.subagentType,
       git_branch: stream.gitBranch,
