@@ -21,6 +21,8 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const { execSync } = require('child_process');
+const { createHash } = require('crypto');
 
 // --- Config ---
 
@@ -95,6 +97,98 @@ function shouldThrottle(streamId) {
   const state = getStreamState(streamId);
   if (!state || !state.last_tick_at) return false;
   return Date.now() - state.last_tick_at < TICK_INTERVAL_MS;
+}
+
+function toAbsoluteDir(maybePath) {
+  if (!maybePath || typeof maybePath !== 'string') return null;
+  const candidate = path.isAbsolute(maybePath)
+    ? maybePath
+    : path.join(process.env.HOME || '/', maybePath);
+  try {
+    const stat = fs.statSync(candidate);
+    if (stat.isDirectory()) return candidate;
+    return path.dirname(candidate);
+  } catch {
+    return null;
+  }
+}
+
+function gitExec(cwd, command) {
+  try {
+    return execSync(command, {
+      cwd,
+      timeout: 3000,
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function parseRepoFullName(repoUrl) {
+  if (!repoUrl) return null;
+  let m = repoUrl.match(/^git@[^:]+:([^/]+)\/(.+?)(?:\.git)?$/i);
+  if (!m) m = repoUrl.match(/^https?:\/\/[^/]+\/([^/]+)\/(.+?)(?:\.git)?(?:\/)?$/i);
+  if (!m) m = repoUrl.match(/^ssh:\/\/git@[^/]+\/([^/]+)\/(.+?)(?:\.git)?$/i);
+  if (!m) return null;
+  return `${m[1]}/${m[2]}`.toLowerCase();
+}
+
+function resolveGitContext(input) {
+  const roots = Array.isArray(input.workspace_roots) ? input.workspace_roots : [];
+  const pathCandidates = [
+    input.cwd,
+    roots[0],
+    input.file_path,
+    input.tool_input?.file_path,
+    Array.isArray(input.modified_files) ? input.modified_files[0] : null,
+  ];
+
+  let workingDir = null;
+  for (const candidate of pathCandidates) {
+    const abs = toAbsoluteDir(candidate);
+    if (abs) {
+      workingDir = abs;
+      break;
+    }
+  }
+
+  if (!workingDir) {
+    return {
+      workspaceFingerprint: null,
+      repoUrl: null,
+      repoFullName: null,
+      repoName: null,
+      branch: null,
+      gitRoot: null,
+    };
+  }
+
+  const gitRoot = gitExec(workingDir, 'git rev-parse --show-toplevel') || workingDir;
+  let workspaceFingerprint = null;
+  try {
+    const resolvedRoot = fs.realpathSync(gitRoot).replace(/\/+$/, '').toLowerCase();
+    workspaceFingerprint = createHash('sha256').update(resolvedRoot).digest('hex');
+  } catch {
+    workspaceFingerprint = null;
+  }
+
+  const repoUrl = gitExec(gitRoot, 'git remote get-url origin');
+  const repoFullName = parseRepoFullName(repoUrl);
+  const branch = gitExec(gitRoot, 'git rev-parse --abbrev-ref HEAD');
+  const repoName = repoFullName
+    ? repoFullName.split('/').pop()
+    : path.basename(gitRoot);
+
+  return {
+    workspaceFingerprint,
+    repoUrl: repoUrl || null,
+    repoFullName,
+    repoName: repoName || null,
+    branch: branch || null,
+    gitRoot,
+  };
 }
 
 function callEdgeFunction(apiKey, fnName, body) {
@@ -225,12 +319,20 @@ function resolveStream(hookEvent, input) {
  * Determine the repo/project for this event.
  * Priority: git_branch > cwd > workspace_roots > modified_files
  */
-function resolveRepo(input, stream) {
+function resolveRepo(input, stream, gitContext) {
   // 1. Git branch from subagent (most specific)
   if (stream.gitBranch) {
     return {
       branch: stream.gitBranch,
-      repo_name: null, // will be resolved by backend from branch
+      repo_name: gitContext.repoName || null,
+    };
+  }
+
+  // 1b. Repo info from local git metadata
+  if (gitContext.repoName || gitContext.branch) {
+    return {
+      branch: gitContext.branch || null,
+      repo_name: gitContext.repoName || null,
     };
   }
 
@@ -316,7 +418,7 @@ function classifyActivity(hookEvent, input) {
  *
  * The x-devclocked-source header handles source attribution separately.
  */
-function buildTrackTickRequest(hookEvent, input, stream, repo) {
+function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext) {
   const now = new Date().toISOString();
 
   // Determine entity (what was acted on) and entity_type
@@ -381,6 +483,9 @@ function buildTrackTickRequest(hookEvent, input, stream, repo) {
     is_write: isWrite,
     project_name: repo.repo_name || undefined,
     branch: repo.branch || stream.gitBranch || undefined,
+    repo_url: gitContext.repoUrl || undefined,
+    repository_full_name: gitContext.repoFullName || undefined,
+    repos: gitContext.repoFullName ? { full_name: gitContext.repoFullName } : undefined,
     code_lines_added: linesAdded || undefined,
     code_lines_deleted: linesDeleted || undefined,
     activity_context: {
@@ -413,9 +518,9 @@ function buildTrackTickRequest(hookEvent, input, stream, repo) {
     ticks: [tick],
   };
 
-  // Add workspace fingerprint if available
-  if (input.workspace_roots && input.workspace_roots[0]) {
-    request.workspace_fingerprint = input.workspace_roots[0];
+  // Add normalized workspace fingerprint if available
+  if (gitContext.workspaceFingerprint) {
+    request.workspace_fingerprint = gitContext.workspaceFingerprint;
   }
 
   return request;
@@ -488,18 +593,22 @@ async function main() {
   }
 
   // Resolve repo/project attribution
-  const repo = resolveRepo(input, stream);
+  const gitContext = resolveGitContext(input);
+  const repo = resolveRepo(input, stream, gitContext);
 
   // Build and send tick in track-tick API format
-  const payload = buildTrackTickRequest(hookEvent, input, stream, repo);
+  const payload = buildTrackTickRequest(hookEvent, input, stream, repo, gitContext);
 
   try {
     await callEdgeFunction(apiKey, 'track-tick', payload);
 
-    // Update throttle state for this stream
-    const state = getStreamState(stream.streamId) || {};
-    state.last_tick_at = Date.now();
-    saveStreamState(stream.streamId, state);
+    // Update throttle state only for non-lifecycle activity ticks.
+    // Lifecycle ticks should not suppress the first real tool tick.
+    if (!isLifecycleEvent) {
+      const state = getStreamState(stream.streamId) || {};
+      state.last_tick_at = Date.now();
+      saveStreamState(stream.streamId, state);
+    }
   } catch {
     // fail silently — don't block Cursor
   }
