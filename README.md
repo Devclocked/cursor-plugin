@@ -22,6 +22,38 @@ This plugin connects Cursor's AI to your real time tracking data, so you can ask
 3. **Install this plugin** from the Cursor marketplace
 4. **Start coding** — tracking is automatic
 
+## How It Works
+
+Cursor hooks now use a two-stage flow:
+
+- the hook captures a tiny local event and exits immediately
+- a background shipper enriches the event with repo metadata and sends it to DevClocked
+
+That keeps tracking reliable even when git or network calls are slow.
+
+## Debugging
+
+If you need to inspect local Cursor tracking state, run:
+
+```bash
+node ~/.cursor/plugins/cache/devclocked/devclocked/<plugin-version>/hooks/status.js
+```
+
+Or for machine-readable output:
+
+```bash
+node ~/.cursor/plugins/cache/devclocked/devclocked/<plugin-version>/hooks/status.js --json
+```
+
+The status report shows:
+
+- whether `~/.config/devclocked/cli.json` is present
+- queued hook events waiting to ship
+- active stream state files
+- cached git context entries
+- whether a shipper lock is active
+- recent local hook and shipper logs
+
 ## What's included
 
 ### MCP Server
