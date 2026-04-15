@@ -72,7 +72,7 @@ async function processEnvelope(filePath, apiKey) {
   const stream = resolveStream(hookEvent, input);
   initializeLifecycleState(hookEvent, stream);
 
-  if (!isLifecycleEvent(hookEvent) && shouldThrottle(stream.streamId)) {
+  if (!isLifecycleEvent(hookEvent) && shouldThrottle(stream.throttleId || stream.streamId)) {
     discardEnvelope(filePath, envelope, 'throttled');
     return;
   }
@@ -84,9 +84,10 @@ async function processEnvelope(filePath, apiKey) {
   try {
     await callEdgeFunction(apiKey, 'track-tick', payload);
     if (!isLifecycleEvent(hookEvent)) {
-      const state = getStreamState(stream.streamId) || {};
+      const throttleStateId = stream.throttleId || stream.streamId;
+      const state = getStreamState(throttleStateId) || {};
       state.last_tick_at = Date.now();
-      saveStreamState(stream.streamId, state);
+      saveStreamState(throttleStateId, state);
     }
 
     if (hookEvent === 'sessionEnd' || hookEvent === 'subagentStop') {

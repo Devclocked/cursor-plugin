@@ -55,6 +55,29 @@ function appendLog(name, message, extra) {
   }
 }
 
+function normalizeOpaqueId(value) {
+  if (value === null || value === undefined) return null;
+  const lines = String(value)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) return null;
+
+  const preferredCallId = lines.find((line) => line.startsWith('call_'));
+  if (preferredCallId) return preferredCallId;
+
+  return lines[0];
+}
+
+function firstOpaqueId(...values) {
+  for (const value of values) {
+    const normalized = normalizeOpaqueId(value);
+    if (normalized) return normalized;
+  }
+  return null;
+}
+
 function loadAuth() {
   try {
     const config = readJsonFile(CLI_CONFIG_PATH);
@@ -264,21 +287,34 @@ function callEdgeFunction(apiKey, fnName, body) {
 }
 
 function resolveStream(hookEvent, input) {
-  const streamId = input.conversation_id || input.session_id || 'unknown';
+  const sessionRootId =
+    firstOpaqueId(input.session_id, input.conversation_id, input.parent_conversation_id) || 'unknown';
+  const primaryStreamId =
+    firstOpaqueId(
+      input.generation_id,
+      input.request_id,
+      input.turn_id,
+      input.prompt_id,
+      input.message_id,
+      input.interaction_id,
+      input.composer_id,
+      input.conversation_id,
+      input.session_id
+    ) || sessionRootId;
+  const parentConversationId = firstOpaqueId(input.parent_conversation_id);
+  const subagentId = firstOpaqueId(input.subagent_id, input.tool_call_id);
 
   if (hookEvent === 'subagentStart') {
-    const parentState = input.parent_conversation_id
-      ? getStreamState(input.parent_conversation_id)
-      : null;
+    const parentState = parentConversationId ? getStreamState(parentConversationId) : null;
     const rootStreamId =
       parentState?.root_stream_id ||
-      input.parent_conversation_id ||
-      input.subagent_id ||
-      streamId;
+      parentConversationId ||
+      sessionRootId;
     return {
-      streamId: input.subagent_id || streamId,
-      parentStreamId: input.parent_conversation_id || null,
+      streamId: subagentId || primaryStreamId,
+      parentStreamId: parentConversationId,
       rootStreamId,
+      throttleId: subagentId || rootStreamId,
       isSubagent: true,
       isParallel: input.is_parallel_worker || false,
       subagentType: input.subagent_type || null,
@@ -288,15 +324,15 @@ function resolveStream(hookEvent, input) {
   }
 
   if (hookEvent === 'subagentStop') {
-    const existing = getStreamState(input.subagent_id || streamId);
+    const existing = getStreamState(subagentId || primaryStreamId);
     return {
-      streamId: input.subagent_id || streamId,
-      parentStreamId: input.parent_conversation_id || null,
+      streamId: subagentId || primaryStreamId,
+      parentStreamId: parentConversationId,
       rootStreamId:
         existing?.root_stream_id ||
-        input.parent_conversation_id ||
-        input.subagent_id ||
-        streamId,
+        parentConversationId ||
+        sessionRootId,
+      throttleId: subagentId || parentConversationId || sessionRootId,
       isSubagent: true,
       isParallel: false,
       subagentType: input.subagent_type || null,
@@ -306,11 +342,11 @@ function resolveStream(hookEvent, input) {
   }
 
   if (hookEvent === 'sessionStart' || hookEvent === 'sessionEnd') {
-    const rootId = input.session_id || streamId;
     return {
-      streamId: rootId,
+      streamId: sessionRootId,
       parentStreamId: null,
-      rootStreamId: rootId,
+      rootStreamId: sessionRootId,
+      throttleId: sessionRootId,
       isSubagent: false,
       isParallel: false,
       subagentType: null,
@@ -319,12 +355,13 @@ function resolveStream(hookEvent, input) {
     };
   }
 
-  const existingState = getStreamState(streamId);
+  const existingState = getStreamState(primaryStreamId) || getStreamState(sessionRootId);
 
   return {
-    streamId,
+    streamId: primaryStreamId,
     parentStreamId: existingState?.parent_stream_id || null,
-    rootStreamId: existingState?.root_stream_id || streamId,
+    rootStreamId: existingState?.root_stream_id || sessionRootId,
+    throttleId: existingState?.parent_stream_id ? primaryStreamId : sessionRootId,
     isSubagent: existingState?.is_subagent || false,
     isParallel: existingState?.is_parallel || false,
     subagentType: existingState?.subagent_type || null,
@@ -466,6 +503,7 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext) {
   };
   const runtimeMs = 5_000;
   const runtimeEndedAt = new Date(new Date(now).getTime() + runtimeMs).toISOString();
+  const sessionFileId = firstOpaqueId(input.session_id, input.conversation_id) || undefined;
   const runId = `cursor:${stream.rootStreamId || stream.streamId}`;
 
   const tick = {
@@ -487,7 +525,7 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext) {
         work_signature: workSignature,
         summary: `Cursor ${activity.sub_type}`,
         timestamp: now,
-        session_file_id: input.session_id || input.conversation_id || undefined,
+        session_file_id: sessionFileId,
         run_id: runId,
         request_key: `${runId}:${hookEvent}:${now}`,
         runtime_ms: runtimeMs,
@@ -647,4 +685,5 @@ module.exports = {
   saveStreamState,
   shouldRetryEnvelope,
   shouldThrottle,
+  normalizeOpaqueId,
 };
