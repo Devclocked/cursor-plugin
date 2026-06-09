@@ -1,16 +1,8 @@
-# DevClocked — Cursor Plugin
+# DevClocked Cursor Plugin
 
-**Automatic time tracking with AI-powered insights, built natively for Cursor.**
+Automatic time tracking for developers using Cursor.
 
-DevClocked tracks your coding sessions, file activity, git commits, and AI interactions — then gives you a complete picture on your [dashboard](https://app.devclocked.com).
-
-This plugin connects Cursor's AI to your real time tracking data, so you can ask questions like:
-
-- "How long have I been coding today?"
-- "What did I work on this week?"
-- "Where is most of my time going?"
-
-...and get answers backed by actual data, not guesses.
+DevClocked tracks coding sessions, file activity, git commits, and Cursor interaction metadata, then shows the results on your [dashboard](https://app.devclocked.com).
 
 ## Setup
 
@@ -57,31 +49,19 @@ The status report shows:
 ## What's included
 
 ### MCP Server
-Connects Cursor's AI to your DevClocked data. Provides tools for fetching today's activity, weekly summaries, active sessions, and project lists.
+Provides tools for fetching today's activity, weekly summaries, active sessions, and project lists.
 
 ### Rules
-Persistent AI guidance so Cursor knows time tracking is active and uses real data when discussing your productivity.
+Persistent Cursor guidance so time tracking is active and productivity summaries use real data.
 
 ### Skills
 - **Time Review** — ask about your coding time and get a clear summary
 - **Productivity Summary** — weekly recaps with actionable insights
 
-### Agent
-- **Productivity Coach** — a developer-focused coach that grounds suggestions in your actual tracked activity
-
-## The full DevClocked ecosystem
-
-This Cursor plugin tracks your AI-assisted coding. For full-workflow coverage:
-
-- **[Web Dashboard](https://app.devclocked.com)** — analytics, session history, project breakdowns
-- **[VS Code Extension](https://marketplace.visualstudio.com/items?itemName=devclocked.devclocked-vscode)** — IDE activity tracking
-- **[Desktop App](https://devclocked.com/download)** — macOS menubar app, tracks Claude Code terminal sessions
-- **[Chrome Extension](https://devclocked.com/download)** — tracks GitHub, Stack Overflow, and browser-based dev tools
-
 ## Privacy
 
 - Your code never leaves your machine — only timestamps and metadata are synced
-- No prompts or AI responses are collected
+- No prompts or responses are collected
 - All data encrypted in transit (TLS 1.3)
 - [Read more](https://devclocked.com/privacy)
 
@@ -93,4 +73,4 @@ This Cursor plugin tracks your AI-assisted coding. For full-workflow coverage:
 
 ## License
 
-MIT — [view source](https://github.com/devclocked/trackers)
+MIT
