@@ -25,7 +25,7 @@ const {
 } = require('./runtime');
 
 function isLifecycleEvent(hookEvent) {
-  return ['sessionStart', 'sessionEnd', 'subagentStart', 'subagentStop'].includes(hookEvent);
+  return ['sessionStart', 'sessionEnd', 'stop'].includes(hookEvent);
 }
 
 function initializeLifecycleState(hookEvent, stream) {
@@ -33,27 +33,10 @@ function initializeLifecycleState(hookEvent, stream) {
     saveStreamState(stream.streamId, {
       started_at: Date.now(),
       last_tick_at: null,
-      is_subagent: false,
       parent_stream_id: null,
       root_stream_id: stream.streamId,
-      is_parallel: false,
-      subagent_type: null,
       git_branch: null,
       task: null,
-    });
-  }
-
-  if (hookEvent === 'subagentStart') {
-    saveStreamState(stream.streamId, {
-      started_at: Date.now(),
-      last_tick_at: null,
-      is_subagent: true,
-      parent_stream_id: stream.parentStreamId,
-      root_stream_id: stream.rootStreamId || stream.parentStreamId || stream.streamId,
-      is_parallel: stream.isParallel,
-      subagent_type: stream.subagentType,
-      git_branch: stream.gitBranch,
-      task: stream.task,
     });
   }
 }
@@ -90,7 +73,7 @@ async function processEnvelope(filePath, apiKey) {
       saveStreamState(throttleStateId, state);
     }
 
-    if (hookEvent === 'sessionEnd' || hookEvent === 'subagentStop') {
+    if (hookEvent === 'sessionEnd') {
       removeStreamState(stream.streamId);
     }
 

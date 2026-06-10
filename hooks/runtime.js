@@ -23,6 +23,7 @@ const LOCK_STALE_MS = 60_000;
 const GIT_CACHE_TTL_MS = 60_000;
 const MAX_SHIP_ATTEMPTS = 5;
 const RETRY_BACKOFF_MS = 15_000;
+const MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024;
 
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
@@ -76,6 +77,216 @@ function firstOpaqueId(...values) {
     if (normalized) return normalized;
   }
   return null;
+}
+
+function toTokenNumber(value) {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+    return Math.floor(value);
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed >= 0) return Math.floor(parsed);
+  }
+  return 0;
+}
+
+function firstTokenNumber(source, names) {
+  if (!source || typeof source !== 'object') return 0;
+  for (const name of names) {
+    if (Object.prototype.hasOwnProperty.call(source, name)) {
+      const value = toTokenNumber(source[name]);
+      if (value > 0) return value;
+    }
+  }
+  return 0;
+}
+
+function tokenUsageHasValue(usage) {
+  return Boolean(usage && (usage.input > 0 || usage.output > 0 || usage.cached > 0 || usage.reasoning > 0));
+}
+
+function mergeTokenUsage(a, b) {
+  if (!a) return b || null;
+  if (!b) return a;
+  return {
+    input: a.input + b.input,
+    output: a.output + b.output,
+    cached: (a.cached || 0) + (b.cached || 0),
+    reasoning: (a.reasoning || 0) + (b.reasoning || 0),
+  };
+}
+
+function normalizeTokenUsage(container) {
+  if (!container || typeof container !== 'object') return null;
+
+  const input = firstTokenNumber(container, [
+    'input',
+    'input_tokens',
+    'inputTokens',
+    'prompt_tokens',
+    'promptTokens',
+    'promptTokenCount',
+  ]);
+  const output = firstTokenNumber(container, [
+    'output',
+    'output_tokens',
+    'outputTokens',
+    'completion_tokens',
+    'completionTokens',
+    'completionTokenCount',
+    'generated_tokens',
+    'generatedTokens',
+  ]);
+  let cached = firstTokenNumber(container, [
+    'cached',
+    'cached_tokens',
+    'cachedTokens',
+    'cached_input_tokens',
+    'cachedInputTokens',
+    'cache_read_input_tokens',
+    'cacheReadInputTokens',
+    'cache_creation_input_tokens',
+    'cacheCreationInputTokens',
+  ]);
+  let reasoning = firstTokenNumber(container, [
+    'reasoning',
+    'reasoning_tokens',
+    'reasoningTokens',
+    'reasoning_output_tokens',
+    'reasoningOutputTokens',
+  ]);
+
+  const inputDetails = container.input_tokens_details || container.inputTokensDetails || container.prompt_tokens_details || container.promptTokensDetails;
+  if (inputDetails && typeof inputDetails === 'object') {
+    cached += firstTokenNumber(inputDetails, ['cached_tokens', 'cachedTokens', 'cache_read_input_tokens', 'cacheReadInputTokens']);
+  }
+
+  const outputDetails = container.output_tokens_details || container.outputTokensDetails || container.completion_tokens_details || container.completionTokensDetails;
+  if (outputDetails && typeof outputDetails === 'object') {
+    reasoning += firstTokenNumber(outputDetails, ['reasoning_tokens', 'reasoningTokens']);
+  }
+
+  const usage = { input, output, cached, reasoning };
+  return tokenUsageHasValue(usage) ? usage : null;
+}
+
+function collectTokenUsageCandidates(value, candidates = [], depth = 0) {
+  if (!value || typeof value !== 'object' || depth > 6) return candidates;
+
+  const direct = normalizeTokenUsage(value);
+  if (direct) candidates.push(direct);
+
+  const knownContainers = ['usage', 'token_usage', 'tokenUsage', 'tokenCount', 'last_token_usage'];
+  for (const key of knownContainers) {
+    const usage = normalizeTokenUsage(value[key]);
+    if (usage) candidates.push(usage);
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectTokenUsageCandidates(item, candidates, depth + 1);
+    }
+    return candidates;
+  }
+
+  for (const [key, nested] of Object.entries(value)) {
+    if (knownContainers.includes(key)) continue;
+    if (nested && typeof nested === 'object') {
+      collectTokenUsageCandidates(nested, candidates, depth + 1);
+    }
+  }
+
+  return candidates;
+}
+
+function objectContainsId(value, ids, depth = 0) {
+  if (!value || typeof value !== 'object' || ids.length === 0 || depth > 6) return false;
+
+  if (Array.isArray(value)) {
+    return value.some((item) => objectContainsId(item, ids, depth + 1));
+  }
+
+  for (const [key, nested] of Object.entries(value)) {
+    if (typeof nested === 'string' && ids.includes(nested)) {
+      const lowerKey = key.toLowerCase();
+      if (lowerKey.includes('id') || lowerKey.includes('request')) return true;
+    }
+    if (nested && typeof nested === 'object' && objectContainsId(nested, ids, depth + 1)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function readTranscriptTail(filePath) {
+  if (!filePath || typeof filePath !== 'string' || !path.isAbsolute(filePath)) return null;
+
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return null;
+    const length = Math.min(stat.size, MAX_TRANSCRIPT_BYTES);
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const buffer = Buffer.alloc(length);
+      fs.readSync(fd, buffer, 0, length, stat.size - length);
+      return buffer.toString('utf-8');
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
+function extractTokenUsageFromTranscript(input) {
+  const raw = readTranscriptTail(input.transcript_path);
+  if (!raw) return null;
+
+  const ids = [
+    input.generation_id,
+    input.request_id,
+    input.turn_id,
+    input.prompt_id,
+    input.message_id,
+    input.interaction_id,
+  ]
+    .map(normalizeOpaqueId)
+    .filter(Boolean);
+
+  let latest = null;
+  let matched = null;
+
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    try {
+      const record = JSON.parse(trimmed);
+      const candidates = collectTokenUsageCandidates(record);
+      if (candidates.length === 0) continue;
+
+      const recordUsage = candidates.reduce((sum, usage) => mergeTokenUsage(sum, usage), null);
+      if (!recordUsage) continue;
+
+      if (objectContainsId(record, ids)) {
+        matched = mergeTokenUsage(matched, recordUsage);
+      } else {
+        latest = recordUsage;
+      }
+    } catch {
+      // Transcript formats vary; ignore non-JSON lines.
+    }
+  }
+
+  return matched || latest;
+}
+
+function extractTokenUsage(input) {
+  const directCandidates = collectTokenUsageCandidates(input);
+  const directUsage = directCandidates.reduce((sum, usage) => mergeTokenUsage(sum, usage), null);
+  if (directUsage) return directUsage;
+  return extractTokenUsageFromTranscript(input);
 }
 
 function loadAuth() {
@@ -301,55 +512,12 @@ function resolveStream(hookEvent, input) {
       input.conversation_id,
       input.session_id
     ) || sessionRootId;
-  const parentConversationId = firstOpaqueId(input.parent_conversation_id);
-  const subagentId = firstOpaqueId(input.subagent_id, input.tool_call_id);
-
-  if (hookEvent === 'subagentStart') {
-    const parentState = parentConversationId ? getStreamState(parentConversationId) : null;
-    const rootStreamId =
-      parentState?.root_stream_id ||
-      parentConversationId ||
-      sessionRootId;
-    return {
-      streamId: subagentId || primaryStreamId,
-      parentStreamId: parentConversationId,
-      rootStreamId,
-      throttleId: subagentId || rootStreamId,
-      isSubagent: true,
-      isParallel: input.is_parallel_worker || false,
-      subagentType: input.subagent_type || null,
-      gitBranch: input.git_branch || null,
-      task: input.task || null,
-    };
-  }
-
-  if (hookEvent === 'subagentStop') {
-    const existing = getStreamState(subagentId || primaryStreamId);
-    return {
-      streamId: subagentId || primaryStreamId,
-      parentStreamId: parentConversationId,
-      rootStreamId:
-        existing?.root_stream_id ||
-        parentConversationId ||
-        sessionRootId,
-      throttleId: subagentId || parentConversationId || sessionRootId,
-      isSubagent: true,
-      isParallel: false,
-      subagentType: input.subagent_type || null,
-      gitBranch: null,
-      task: input.task || null,
-    };
-  }
-
   if (hookEvent === 'sessionStart' || hookEvent === 'sessionEnd') {
     return {
       streamId: sessionRootId,
       parentStreamId: null,
       rootStreamId: sessionRootId,
       throttleId: sessionRootId,
-      isSubagent: false,
-      isParallel: false,
-      subagentType: null,
       gitBranch: null,
       task: null,
     };
@@ -362,9 +530,6 @@ function resolveStream(hookEvent, input) {
     parentStreamId: existingState?.parent_stream_id || null,
     rootStreamId: existingState?.root_stream_id || sessionRootId,
     throttleId: existingState?.parent_stream_id ? primaryStreamId : sessionRootId,
-    isSubagent: existingState?.is_subagent || false,
-    isParallel: existingState?.is_parallel || false,
-    subagentType: existingState?.subagent_type || null,
     gitBranch: existingState?.git_branch || null,
     task: existingState?.task || null,
   };
@@ -443,10 +608,8 @@ function classifyActivity(hookEvent, input) {
       return { activity_type: 'coding', sub_type: 'tool_use' };
     case 'afterShellExecution':
       return { activity_type: 'coding', sub_type: 'shell' };
-    case 'subagentStart':
-      return { activity_type: 'planning', sub_type: 'stream_start' };
-    case 'subagentStop':
-      return { activity_type: 'coding', sub_type: 'stream_end' };
+    case 'stop':
+      return { activity_type: 'coding', sub_type: 'turn_stop' };
     default:
       return { activity_type: 'coding', sub_type: hookEvent };
   }
@@ -486,19 +649,19 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext) {
     entity = `cursor://shell/${input.command.split(/\s/)[0]}`;
     entityType = 'window';
     isWrite = true;
-  } else if (hookEvent === 'subagentStart' || hookEvent === 'subagentStop') {
-    const agentType = input.subagent_type || stream.subagentType || 'agent';
-    entity = `cursor://agent/${agentType}/${stream.streamId}`;
   } else if (hookEvent === 'sessionStart' || hookEvent === 'sessionEnd') {
     entity = `cursor://session/${stream.streamId}`;
+  } else if (hookEvent === 'stop') {
+    entity = `cursor://turn/${stream.streamId}`;
   }
 
   const activity = classifyActivity(hookEvent, input);
+  const tokenUsage = extractTokenUsage(input);
   const workSignature = {
     read_count: activity.activity_type === 'reading' ? 1 : 0,
     write_count: isWrite ? 1 : 0,
     exec_count: activity.sub_type === 'shell' ? 1 : 0,
-    plan_count: activity.activity_type === 'planning' ? 1 : 0,
+    plan_count: activity.activity_type === 'planning' || (tokenUsage && !isWrite) ? 1 : 0,
     total_turns: 1,
   };
   const runtimeMs = 5_000;
@@ -531,13 +694,18 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext) {
         runtime_ms: runtimeMs,
         runtime_started_at: now,
         runtime_ended_at: runtimeEndedAt,
+        token_usage: tokenUsage ? {
+          input: tokenUsage.input,
+          output: tokenUsage.output,
+          cached: tokenUsage.cached > 0 ? tokenUsage.cached : undefined,
+          reasoning: tokenUsage.reasoning > 0 ? tokenUsage.reasoning : undefined,
+        } : undefined,
         measurement_quality: 'estimated',
         is_sidechain: Boolean(stream.parentStreamId),
         stream_id: stream.streamId,
         parent_stream_id: stream.parentStreamId || undefined,
         root_stream_id: stream.rootStreamId || stream.streamId,
         stream_role: stream.parentStreamId ? 'sidechain' : 'primary',
-        agent_id: stream.isSubagent ? stream.streamId : undefined,
         ai_tool_version: 1,
       },
     },
@@ -686,4 +854,5 @@ module.exports = {
   shouldRetryEnvelope,
   shouldThrottle,
   normalizeOpaqueId,
+  extractTokenUsage,
 };
