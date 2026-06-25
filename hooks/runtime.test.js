@@ -4,7 +4,14 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { buildTrackTickRequest, extractTokenUsage, normalizeOpaqueId, resolveStream } = require('./runtime');
+const {
+  buildTrackTickRequest,
+  extractTokenUsage,
+  normalizeOpaqueId,
+  resolveStream,
+  pruneStaleStreamState,
+  PLUGIN_VERSION,
+} = require('./runtime');
 
 test('normalizeOpaqueId strips multiline Cursor ids down to a single opaque id', () => {
   const value = 'call_SbFRlMHiWQGs7gPhfSlvuQuR\nfc_010746da2e9a9d97f09c8e9103e69c7f606f8119c6abb2db795051005982a';
@@ -136,4 +143,40 @@ test('buildTrackTickRequest includes token usage on Cursor stop ticks', () => {
     cached: undefined,
     reasoning: undefined,
   });
+});
+
+test('buildTrackTickRequest stamps the installed plugin version', () => {
+  const payload = buildTrackTickRequest(
+    'postToolUse',
+    { conversation_id: 'conv-1', session_id: 'conv-1', tool_name: 'Read' },
+    { streamId: 'conv-1', parentStreamId: null, rootStreamId: 'conv-1', gitBranch: null },
+    { branch: null, repo_name: 'example' },
+    { repoUrl: null, repoFullName: null, workspaceFingerprint: null }
+  );
+
+  const aiTool = payload.ticks[0].activity_context.ai_tool;
+  assert.equal(aiTool.plugin_version, PLUGIN_VERSION);
+  assert.match(PLUGIN_VERSION, /^\d+\.\d+\.\d+$/);
+});
+
+test('pruneStaleStreamState removes expired stream files and keeps fresh ones', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devclocked-cursor-state-'));
+  const now = 1_000_000_000_000;
+  const ttl = 6 * 60 * 60 * 1000;
+
+  const write = (name, body) => fs.writeFileSync(path.join(dir, name), JSON.stringify(body));
+  write('stream_fresh.json', { last_tick_at: now - 1000 });
+  write('stream_stale.json', { last_tick_at: now - ttl - 1000 });
+  write('stream_started_only.json', { started_at: now - ttl - 1000 });
+  write('stream_orphan.json', {});
+  write('not-a-stream.json', { last_tick_at: now });
+
+  try {
+    const removed = pruneStaleStreamState(now, dir, ttl);
+    assert.equal(removed, 3);
+    const remaining = fs.readdirSync(dir).sort();
+    assert.deepEqual(remaining, ['not-a-stream.json', 'stream_fresh.json']);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
