@@ -24,6 +24,20 @@ const GIT_CACHE_TTL_MS = 60_000;
 const MAX_SHIP_ATTEMPTS = 5;
 const RETRY_BACKOFF_MS = 15_000;
 const MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024;
+const STREAM_STATE_TTL_MS = 6 * 60 * 60 * 1000;
+
+function readPluginVersion() {
+  try {
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(__dirname, '..', '.cursor-plugin', 'plugin.json'), 'utf-8')
+    );
+    return typeof manifest.version === 'string' && manifest.version ? manifest.version : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+const PLUGIN_VERSION = readPluginVersion();
 
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
@@ -324,6 +338,37 @@ function shouldThrottle(streamId) {
   return Date.now() - state.last_tick_at < TICK_INTERVAL_MS;
 }
 
+function pruneStaleStreamState(now = Date.now(), dir = STATE_DIR, ttlMs = STREAM_STATE_TTL_MS) {
+  let removed = 0;
+  let files;
+  try {
+    files = fs.readdirSync(dir);
+  } catch {
+    return 0;
+  }
+
+  for (const name of files) {
+    if (!name.startsWith('stream_') || !name.endsWith('.json')) continue;
+    const filePath = path.join(dir, name);
+    let stale = true;
+    try {
+      const state = readJsonFile(filePath);
+      const lastSeen = state.last_tick_at || state.started_at;
+      stale = !lastSeen || now - lastSeen > ttlMs;
+    } catch {
+      stale = true;
+    }
+    if (!stale) continue;
+    try {
+      fs.unlinkSync(filePath);
+      removed += 1;
+    } catch {
+      // ignore
+    }
+  }
+  return removed;
+}
+
 function toAbsoluteDir(maybePath) {
   if (!maybePath || typeof maybePath !== 'string') return null;
   const candidate = path.isAbsolute(maybePath)
@@ -470,6 +515,7 @@ function callEdgeFunction(apiKey, fnName, body) {
           'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
           'x-devclocked-key': apiKey,
           'x-devclocked-source': 'cursor-plugin',
+          'x-devclocked-plugin-version': PLUGIN_VERSION,
           'Content-Length': Buffer.byteLength(data),
         },
         timeout: 10_000,
@@ -707,6 +753,7 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext) {
         root_stream_id: stream.rootStreamId || stream.streamId,
         stream_role: stream.parentStreamId ? 'sidechain' : 'primary',
         ai_tool_version: 1,
+        plugin_version: PLUGIN_VERSION,
       },
     },
   };
@@ -853,6 +900,8 @@ module.exports = {
   saveStreamState,
   shouldRetryEnvelope,
   shouldThrottle,
+  pruneStaleStreamState,
   normalizeOpaqueId,
   extractTokenUsage,
+  PLUGIN_VERSION,
 };

@@ -13,6 +13,7 @@ const {
   listQueueFiles,
   loadAuth,
   markEnvelopeRetry,
+  pruneStaleStreamState,
   readJsonFile,
   releaseShipperLock,
   removeStreamState,
@@ -108,6 +109,11 @@ async function main() {
     const queueFiles = listQueueFiles();
     for (const filePath of queueFiles) {
       await processEnvelope(filePath, apiKey);
+    }
+
+    const prunedStreams = pruneStaleStreamState();
+    if (prunedStreams > 0) {
+      appendLog('shipper', 'Pruned stale stream state', { count: prunedStreams });
     }
   } catch (error) {
     appendLog('shipper', 'Shipper crashed', {
