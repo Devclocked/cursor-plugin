@@ -637,6 +637,36 @@ function resolveRepo(input, stream, gitContext) {
   return { branch: null, repo_name: 'unknown' };
 }
 
+// Cursor reports its auto-selected model with sentinel names that are not real
+// model identifiers. We skip these so the backend never tries to price "default".
+const NON_MODEL_SENTINELS = new Set(['default', 'auto', 'cursor-small', '']);
+
+// Resolve the AI model id from a Cursor hook input. Cursor provides `model` on
+// agent hooks; sentinel values ("default"/"auto") are dropped as unbillable.
+function resolveModel(input) {
+  const raw = typeof input.model === 'string' ? input.model.trim() : '';
+  if (!raw) return null;
+  if (NON_MODEL_SENTINELS.has(raw.toLowerCase())) return null;
+  return raw;
+}
+
+// Best-effort provider inference from a Cursor model id (Cursor doesn't expose
+// provider). Returns null when unknown so the backend's model→provider map wins.
+function inferModelProvider(model) {
+  if (!model) return null;
+  const m = model.toLowerCase();
+  if (m.includes('claude') || m.includes('fable') || m.includes('opus') || m.includes('sonnet') || m.includes('haiku')) {
+    return 'anthropic';
+  }
+  if (m.startsWith('gpt') || m.startsWith('o1') || m.startsWith('o3') || m.startsWith('o4') || m.includes('codex')) {
+    return 'openai';
+  }
+  if (m.includes('gemini')) return 'google';
+  if (m.includes('grok')) return 'xai';
+  if (m.includes('deepseek')) return 'deepseek';
+  return null;
+}
+
 function classifyActivity(hookEvent, input) {
   switch (hookEvent) {
     case 'sessionStart':
@@ -702,6 +732,9 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext) {
   }
 
   const activity = classifyActivity(hookEvent, input);
+  // Cursor hook input carries the AI model id (but not token usage — DEV-416).
+  const model = resolveModel(input);
+  const modelProvider = inferModelProvider(model);
   const tokenUsage = extractTokenUsage(input);
   const workSignature = {
     read_count: activity.activity_type === 'reading' ? 1 : 0,
@@ -730,6 +763,8 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext) {
     activity_context: {
       ai_tool: {
         tool: 'cursor',
+        model: model || undefined,
+        model_provider: modelProvider || undefined,
         activity_type: activity.activity_type,
         work_signature: workSignature,
         summary: `Cursor ${activity.sub_type}`,
@@ -903,5 +938,7 @@ module.exports = {
   pruneStaleStreamState,
   normalizeOpaqueId,
   extractTokenUsage,
+  resolveModel,
+  inferModelProvider,
   PLUGIN_VERSION,
 };

@@ -10,6 +10,8 @@ const {
   normalizeOpaqueId,
   resolveStream,
   pruneStaleStreamState,
+  resolveModel,
+  inferModelProvider,
   PLUGIN_VERSION,
 } = require('./runtime');
 
@@ -157,6 +159,48 @@ test('buildTrackTickRequest stamps the installed plugin version', () => {
   const aiTool = payload.ticks[0].activity_context.ai_tool;
   assert.equal(aiTool.plugin_version, PLUGIN_VERSION);
   assert.match(PLUGIN_VERSION, /^\d+\.\d+\.\d+$/);
+});
+
+test('resolveModel keeps real models and drops Cursor sentinels', () => {
+  assert.equal(resolveModel({ model: 'claude-opus-4-8' }), 'claude-opus-4-8');
+  assert.equal(resolveModel({ model: 'gpt-5.5' }), 'gpt-5.5');
+  assert.equal(resolveModel({ model: 'default' }), null);
+  assert.equal(resolveModel({ model: 'auto' }), null);
+  assert.equal(resolveModel({}), null);
+});
+
+test('inferModelProvider maps model ids to providers', () => {
+  assert.equal(inferModelProvider('claude-opus-4-8'), 'anthropic');
+  assert.equal(inferModelProvider('gpt-5.5'), 'openai');
+  assert.equal(inferModelProvider('gemini-2.5-pro'), 'google');
+  assert.equal(inferModelProvider('some-unknown-model'), null);
+  assert.equal(inferModelProvider(null), null);
+});
+
+test('buildTrackTickRequest emits model + provider on ticks', () => {
+  const payload = buildTrackTickRequest(
+    'postToolUse',
+    { conversation_id: 'c1', session_id: 'c1', tool_name: 'Shell', model: 'claude-opus-4-8' },
+    { streamId: 'c1', parentStreamId: null, rootStreamId: 'c1', gitBranch: null },
+    { branch: null, repo_name: 'example' },
+    { repoUrl: null, repoFullName: null, workspaceFingerprint: null }
+  );
+  const aiTool = payload.ticks[0].activity_context.ai_tool;
+  assert.equal(aiTool.model, 'claude-opus-4-8');
+  assert.equal(aiTool.model_provider, 'anthropic');
+});
+
+test('buildTrackTickRequest omits model when Cursor reports a sentinel', () => {
+  const payload = buildTrackTickRequest(
+    'postToolUse',
+    { conversation_id: 'c1', session_id: 'c1', tool_name: 'Shell', model: 'auto' },
+    { streamId: 'c1', parentStreamId: null, rootStreamId: 'c1', gitBranch: null },
+    { branch: null, repo_name: 'example' },
+    { repoUrl: null, repoFullName: null, workspaceFingerprint: null }
+  );
+  const aiTool = payload.ticks[0].activity_context.ai_tool;
+  assert.equal(aiTool.model, undefined);
+  assert.equal(aiTool.model_provider, undefined);
 });
 
 test('pruneStaleStreamState removes expired stream files and keeps fresh ones', () => {
