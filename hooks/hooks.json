@@ -36,7 +36,14 @@
         "timeout": 20
       }
     ],
-    "stop": [
+    "subagentStart": [
+      {
+        "command": "node ./hooks/track.js",
+        "type": "command",
+        "timeout": 20
+      }
+    ],
+    "subagentStop": [
       {
         "command": "node ./hooks/track.js",
         "type": "command",
