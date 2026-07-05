@@ -680,23 +680,21 @@ var require_runtime = __commonJS({
       const ratio = linesAdded / linesDeleted;
       return ratio >= 0.5 && ratio <= 2;
     }
-    function isSmallFix(linesAdded, linesDeleted) {
-      const total = linesAdded + linesDeleted;
-      return total > 0 && total <= 30;
-    }
-    function classifyActivity(hookEvent, input) {
+    function classifyActivity(hookEvent, input, stream) {
       switch (hookEvent) {
         case "sessionStart":
           return { activity_type: "coding", sub_type: "session_start" };
-        case "sessionEnd":
-          return { activity_type: "coding", sub_type: "session_end" };
+        case "sessionEnd": {
+          const priorState = stream ? runtime2.getStreamState(stream.streamId) : null;
+          if (priorState && priorState.last_activity_type) {
+            return { activity_type: priorState.last_activity_type, sub_type: "session_end" };
+          }
+          return { activity_type: void 0, sub_type: "session_end" };
+        }
         case "afterFileEdit": {
           const { linesAdded, linesDeleted } = countEditLines(input);
           if (isBalancedChurn(linesAdded, linesDeleted)) {
             return { activity_type: "refactoring", sub_type: "file_refactor" };
-          }
-          if (isSmallFix(linesAdded, linesDeleted)) {
-            return { activity_type: "debugging", sub_type: "file_fix" };
           }
           return { activity_type: "coding", sub_type: "file_edit" };
         }
@@ -755,7 +753,7 @@ var require_runtime = __commonJS({
       } else if (hookEvent === "sessionStart" || hookEvent === "sessionEnd") {
         entity = `cursor://session/${stream.streamId}`;
       }
-      const activity = classifyActivity(hookEvent, input);
+      const activity = classifyActivity(hookEvent, input, stream);
       const model = resolveModel(input);
       const modelProvider = inferModelProvider(model);
       const workSignature = {
@@ -765,7 +763,12 @@ var require_runtime = __commonJS({
         plan_count: activity.activity_type === "planning" ? 1 : 0,
         total_turns: 1
       };
-      const runtimeMs = 5e3;
+      let runtimeMs = 5e3;
+      if (hookEvent === "sessionEnd") {
+        const priorState = runtime2.getStreamState(stream.streamId);
+        const elapsed = priorState && priorState.last_tick_at ? Date.now() - priorState.last_tick_at : null;
+        if (Number.isFinite(elapsed) && elapsed > 0) runtimeMs = elapsed;
+      }
       const runtimeEndedAt = new Date(new Date(now).getTime() + runtimeMs).toISOString();
       const sessionFileId = runtime2.firstOpaqueId(input.session_id, input.conversation_id) || void 0;
       const runId = `cursor:${stream.rootStreamId || stream.streamId}`;

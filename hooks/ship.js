@@ -717,23 +717,21 @@ var require_runtime = __commonJS({
       const ratio = linesAdded / linesDeleted;
       return ratio >= 0.5 && ratio <= 2;
     }
-    function isSmallFix(linesAdded, linesDeleted) {
-      const total = linesAdded + linesDeleted;
-      return total > 0 && total <= 30;
-    }
-    function classifyActivity(hookEvent, input) {
+    function classifyActivity2(hookEvent, input, stream) {
       switch (hookEvent) {
         case "sessionStart":
           return { activity_type: "coding", sub_type: "session_start" };
-        case "sessionEnd":
-          return { activity_type: "coding", sub_type: "session_end" };
+        case "sessionEnd": {
+          const priorState = stream ? runtime2.getStreamState(stream.streamId) : null;
+          if (priorState && priorState.last_activity_type) {
+            return { activity_type: priorState.last_activity_type, sub_type: "session_end" };
+          }
+          return { activity_type: void 0, sub_type: "session_end" };
+        }
         case "afterFileEdit": {
           const { linesAdded, linesDeleted } = countEditLines(input);
           if (isBalancedChurn(linesAdded, linesDeleted)) {
             return { activity_type: "refactoring", sub_type: "file_refactor" };
-          }
-          if (isSmallFix(linesAdded, linesDeleted)) {
-            return { activity_type: "debugging", sub_type: "file_fix" };
           }
           return { activity_type: "coding", sub_type: "file_edit" };
         }
@@ -792,7 +790,7 @@ var require_runtime = __commonJS({
       } else if (hookEvent === "sessionStart" || hookEvent === "sessionEnd") {
         entity = `cursor://session/${stream.streamId}`;
       }
-      const activity = classifyActivity(hookEvent, input);
+      const activity = classifyActivity2(hookEvent, input, stream);
       const model = resolveModel(input);
       const modelProvider = inferModelProvider(model);
       const workSignature = {
@@ -802,7 +800,12 @@ var require_runtime = __commonJS({
         plan_count: activity.activity_type === "planning" ? 1 : 0,
         total_turns: 1
       };
-      const runtimeMs = 5e3;
+      let runtimeMs = 5e3;
+      if (hookEvent === "sessionEnd") {
+        const priorState = runtime2.getStreamState(stream.streamId);
+        const elapsed = priorState && priorState.last_tick_at ? Date.now() - priorState.last_tick_at : null;
+        if (Number.isFinite(elapsed) && elapsed > 0) runtimeMs = elapsed;
+      }
       const runtimeEndedAt = new Date(new Date(now).getTime() + runtimeMs).toISOString();
       const sessionFileId = runtime2.firstOpaqueId(input.session_id, input.conversation_id) || void 0;
       const runId = `cursor:${stream.rootStreamId || stream.streamId}`;
@@ -857,7 +860,7 @@ var require_runtime = __commonJS({
     module2.exports = {
       ...runtime2,
       buildTrackTickRequest: buildTrackTickRequest2,
-      classifyActivity,
+      classifyActivity: classifyActivity2,
       countEditLines,
       inferModelProvider,
       resolveModel,
@@ -876,6 +879,7 @@ var {
   appendLog,
   buildTrackTickRequest,
   callEdgeFunction,
+  classifyActivity,
   discardEnvelope,
   getStreamState,
   markEnvelopeRetry,
@@ -891,6 +895,9 @@ var {
 var runtime = require_runtime();
 function isLifecycleEvent(hookEvent) {
   return ["sessionStart", "sessionEnd", "subagentStart", "subagentStop"].includes(hookEvent);
+}
+function isActivityTypeTransition(priorState, newActivityType) {
+  return Boolean(priorState?.last_activity_type) && priorState.last_activity_type !== newActivityType;
 }
 function initializeLifecycleState(hookEvent, stream) {
   if (hookEvent === "sessionStart") {
@@ -931,9 +938,14 @@ async function processEnvelope(filePath, apiKey) {
   }
   const stream = resolveStream(hookEvent, input);
   initializeLifecycleState(hookEvent, stream);
-  if (!isLifecycleEvent(hookEvent) && shouldThrottle(stream.throttleId || stream.streamId)) {
-    discardEnvelope(filePath, envelope, "throttled");
-    return;
+  const throttleStateId = stream.throttleId || stream.streamId;
+  if (!isLifecycleEvent(hookEvent) && shouldThrottle(throttleStateId)) {
+    const priorState = getStreamState(throttleStateId);
+    const newActivity = classifyActivity(hookEvent, input, stream);
+    if (!isActivityTypeTransition(priorState, newActivity.activity_type)) {
+      discardEnvelope(filePath, envelope, "throttled");
+      return;
+    }
   }
   const gitContext = resolveGitContext(input);
   const repo = resolveRepo(input, stream, gitContext);
@@ -949,9 +961,9 @@ async function processEnvelope(filePath, apiKey) {
       return;
     }
     if (!isLifecycleEvent(hookEvent)) {
-      const throttleStateId = stream.throttleId || stream.streamId;
       const state = getStreamState(throttleStateId) || {};
       state.last_tick_at = Date.now();
+      state.last_activity_type = payload.ticks[0]?.activity_context?.ai_tool?.activity_type || state.last_activity_type;
       saveStreamState(throttleStateId, state);
     }
     if (hookEvent === "sessionEnd" || hookEvent === "subagentStop") {
@@ -973,4 +985,7 @@ async function processEnvelope(filePath, apiKey) {
     });
   }
 }
-runShipper(runtime, processEnvelope);
+if (require.main === module) {
+  runShipper(runtime, processEnvelope);
+}
+module.exports = { isActivityTypeTransition, isLifecycleEvent, processEnvelope };
