@@ -4,9 +4,9 @@ var __commonJS = (cb, mod) => function __require() {
   return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
 };
 
-// ../plugin-runtime/ship.js
+// packages/plugin-runtime/ship.js
 var require_ship = __commonJS({
-  "../plugin-runtime/ship.js"(exports2, module2) {
+  "packages/plugin-runtime/ship.js"(exports2, module2) {
     async function runShipper2(runtime2, processEnvelope2) {
       const lockFd = runtime2.acquireShipperLock();
       if (!lockFd) process.exit(0);
@@ -41,9 +41,9 @@ var require_ship = __commonJS({
   }
 });
 
-// ../plugin-runtime/core.js
+// packages/plugin-runtime/core.js
 var require_core = __commonJS({
-  "../plugin-runtime/core.js"(exports2, module2) {
+  "packages/plugin-runtime/core.js"(exports2, module2) {
     var fs2 = require("fs");
     var path2 = require("path");
     var https = require("https");
@@ -552,9 +552,9 @@ var require_core = __commonJS({
   }
 });
 
-// hooks/runtime.js
+// packages/cursor-plugin/hooks/runtime.js
 var require_runtime = __commonJS({
-  "hooks/runtime.js"(exports2, module2) {
+  "packages/cursor-plugin/hooks/runtime.js"(exports2, module2) {
     var path2 = require("path");
     var { createPluginRuntime } = require_core();
     var runtime2 = createPluginRuntime({
@@ -855,6 +855,9 @@ var require_runtime = __commonJS({
       if (gitContext.workspaceFingerprint) {
         request.workspace_fingerprint = gitContext.workspaceFingerprint;
       }
+      if (gitContext.gitRoot) {
+        request.workspace_path = gitContext.gitRoot;
+      }
       return request;
     }
     module2.exports = {
@@ -870,7 +873,7 @@ var require_runtime = __commonJS({
   }
 });
 
-// hooks/ship.js
+// packages/cursor-plugin/hooks/ship.js
 var fs = require("fs");
 var path = require("path");
 var { runShipper } = require_ship();

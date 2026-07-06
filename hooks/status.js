@@ -4,9 +4,9 @@ var __commonJS = (cb, mod) => function __require() {
   return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
 };
 
-// ../plugin-runtime/core.js
+// packages/plugin-runtime/core.js
 var require_core = __commonJS({
-  "../plugin-runtime/core.js"(exports2, module2) {
+  "packages/plugin-runtime/core.js"(exports2, module2) {
     var fs = require("fs");
     var path = require("path");
     var https = require("https");
@@ -515,9 +515,9 @@ var require_core = __commonJS({
   }
 });
 
-// hooks/runtime.js
+// packages/cursor-plugin/hooks/runtime.js
 var require_runtime = __commonJS({
-  "hooks/runtime.js"(exports2, module2) {
+  "packages/cursor-plugin/hooks/runtime.js"(exports2, module2) {
     var path = require("path");
     var { createPluginRuntime } = require_core();
     var runtime2 = createPluginRuntime({
@@ -818,6 +818,9 @@ var require_runtime = __commonJS({
       if (gitContext.workspaceFingerprint) {
         request.workspace_fingerprint = gitContext.workspaceFingerprint;
       }
+      if (gitContext.gitRoot) {
+        request.workspace_path = gitContext.gitRoot;
+      }
       return request;
     }
     module2.exports = {
@@ -833,9 +836,9 @@ var require_runtime = __commonJS({
   }
 });
 
-// ../plugin-runtime/status.js
+// packages/plugin-runtime/status.js
 var require_status = __commonJS({
-  "../plugin-runtime/status.js"(exports2, module2) {
+  "packages/plugin-runtime/status.js"(exports2, module2) {
     var fs = require("fs");
     var path = require("path");
     function exists(filePath) {
@@ -968,7 +971,7 @@ var require_status = __commonJS({
   }
 });
 
-// hooks/status.js
+// packages/cursor-plugin/hooks/status.js
 var runtime = require_runtime();
 var { printStatus } = require_status();
 printStatus(runtime, "Cursor");

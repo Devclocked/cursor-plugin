@@ -1,7 +1,7 @@
 {
   "name": "devclocked",
   "description": "Automatic time tracking for developers. See where your dev hours go across Cursor, VS Code, Claude Code, and Chrome.",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "author": {
     "name": "DevClocked",
     "email": "support@devclocked.com"
