@@ -4,9 +4,9 @@ var __commonJS = (cb, mod) => function __require() {
   return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
 };
 
-// packages/plugin-runtime/core.js
+// ../plugin-runtime/core.js
 var require_core = __commonJS({
-  "packages/plugin-runtime/core.js"(exports2, module2) {
+  "../plugin-runtime/core.js"(exports2, module2) {
     var fs = require("fs");
     var path = require("path");
     var https = require("https");
@@ -66,6 +66,7 @@ var require_core = __commonJS({
       const namespace = options.namespace;
       const source = options.source;
       const shipperPath = options.shipperPath;
+      const execSyncImpl = options.execSyncImpl || execSync;
       const pluginVersion = options.pluginVersion || readPluginVersion(shipperPath);
       const STATE_DIR = path.join(DEVCLOCKED_HOME, `${namespace}-state`);
       const QUEUE_DIR = path.join(DEVCLOCKED_HOME, `${namespace}-queue`);
@@ -154,17 +155,41 @@ var require_core = __commonJS({
           return null;
         }
       }
-      function gitExec(cwd, command) {
+      const GIT_PATH_FALLBACK = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin";
+      function classifyGitFailure(error) {
+        if (!error || typeof error !== "object") return "git_unavailable";
+        if (error.code === "ETIMEDOUT" || error.signal === "SIGTERM" || error.killed === true) {
+          return "timeout";
+        }
+        if (error.code === "ENOENT" || error.code === "EAGAIN") return "git_unavailable";
+        if (typeof error.status === "number") {
+          if (error.status === 127 || error.status === 126) return "git_unavailable";
+          const stderr = String(error.stderr || "");
+          if (error.status === 128 && /not a git repository/i.test(stderr)) return "not_a_repo";
+          return "git_error";
+        }
+        return "git_unavailable";
+      }
+      function gitExecClassified(cwd, command) {
         try {
-          return execSync(command, {
+          const stdout = execSyncImpl(command, {
             cwd,
             timeout: 3e3,
             encoding: "utf-8",
-            stdio: ["pipe", "pipe", "pipe"]
+            stdio: ["pipe", "pipe", "pipe"],
+            env: {
+              ...process.env,
+              PATH: `${process.env.PATH || ""}:${GIT_PATH_FALLBACK}`
+            }
           }).trim();
-        } catch {
-          return null;
+          return { ok: true, stdout };
+        } catch (error) {
+          return { ok: false, failure: classifyGitFailure(error) };
         }
+      }
+      function gitExec(cwd, command) {
+        const result = gitExecClassified(cwd, command);
+        return result.ok ? result.stdout : null;
       }
       function parseRepoFullName(repoUrl) {
         if (!repoUrl) return null;
@@ -204,56 +229,117 @@ var require_core = __commonJS({
           git_context: gitContext
         });
       }
-      function resolveGitContext(input) {
-        const roots = Array.isArray(input.workspace_roots) ? input.workspace_roots : [];
-        const pathCandidates = [
-          input.file_path,
-          input.tool_input?.file_path,
-          Array.isArray(input.modified_files) ? input.modified_files[0] : null,
-          roots[0],
-          input.cwd
-        ];
-        let workingDir = null;
-        for (const candidate of pathCandidates) {
-          const abs = toAbsoluteDir(candidate);
-          if (abs) {
-            workingDir = abs;
-            break;
-          }
-        }
-        if (!workingDir) {
-          return {
-            workspaceFingerprint: null,
-            repoUrl: null,
-            repoFullName: null,
-            repoName: null,
-            branch: null,
-            gitRoot: null
-          };
-        }
-        const cached = loadCachedGitContext(workingDir);
-        if (cached) return cached;
-        const gitRoot = gitExec(workingDir, "git rev-parse --show-toplevel") || workingDir;
-        let workspaceFingerprint = null;
+      function fingerprintPath(dirPath) {
         try {
-          const resolvedRoot = fs.realpathSync(gitRoot).replace(/\/+$/, "").toLowerCase();
-          workspaceFingerprint = createHash("sha256").update(resolvedRoot).digest("hex");
+          const resolved = fs.realpathSync(dirPath).replace(/\/+$/, "").toLowerCase();
+          return createHash("sha256").update(resolved).digest("hex");
         } catch {
-          workspaceFingerprint = null;
+          return null;
         }
+      }
+      function deferredGitContext(workspacePath, failure) {
+        return {
+          workspaceFingerprint: null,
+          repoUrl: null,
+          repoFullName: null,
+          repoName: null,
+          branch: null,
+          gitRoot: null,
+          workspacePath: workspacePath || null,
+          resolution: "deferred",
+          resolutionFailure: failure || null
+        };
+      }
+      function buildRepoGitContext(gitRoot) {
         const repoUrl = gitExec(gitRoot, "git remote get-url origin");
         const repoFullName = parseRepoFullName(repoUrl);
         const branch = gitExec(gitRoot, "git rev-parse --abbrev-ref HEAD");
         const repoName = repoFullName ? repoFullName.split("/").pop() : path.basename(gitRoot);
-        const gitContext = {
-          workspaceFingerprint,
+        return {
+          workspaceFingerprint: fingerprintPath(gitRoot),
           repoUrl: repoUrl || null,
           repoFullName,
           repoName: repoName || null,
           branch: branch || null,
-          gitRoot
+          gitRoot,
+          workspacePath: gitRoot,
+          resolution: "git",
+          resolutionFailure: null
         };
-        saveCachedGitContext(workingDir, gitContext);
+      }
+      function isGuardedRoot(dirPath) {
+        let resolved = dirPath;
+        try {
+          resolved = fs.realpathSync(dirPath);
+        } catch {
+        }
+        const normalized = resolved.replace(/\/+$/, "") || "/";
+        let home = process.env.HOME || "";
+        try {
+          if (home) home = fs.realpathSync(home);
+        } catch {
+        }
+        home = home.replace(/\/+$/, "");
+        return normalized === "/" || Boolean(home) && normalized === home;
+      }
+      function resolveGitContext(input) {
+        const roots = Array.isArray(input.workspace_roots) ? input.workspace_roots : [];
+        const remote = input.devclocked_capture?.remote === true;
+        const sessionDir = toAbsoluteDir(input.cwd) || toAbsoluteDir(roots[0]);
+        const fileDirCandidates = [
+          input.file_path,
+          input.tool_input?.file_path,
+          Array.isArray(input.modified_files) ? input.modified_files[0] : null
+        ];
+        let fileDir = null;
+        for (const candidate of fileDirCandidates) {
+          const abs = toAbsoluteDir(candidate);
+          if (abs) {
+            fileDir = abs;
+            break;
+          }
+        }
+        const identityDir = sessionDir || fileDir;
+        if (!identityDir) return deferredGitContext(null, "no_working_dir");
+        const cached = loadCachedGitContext(identityDir);
+        if (cached && cached.resolution) return cached;
+        const rootResult = gitExecClassified(identityDir, "git rev-parse --show-toplevel");
+        if (rootResult.ok) {
+          const gitContext2 = buildRepoGitContext(rootResult.stdout);
+          saveCachedGitContext(identityDir, gitContext2);
+          return gitContext2;
+        }
+        if (rootResult.failure !== "not_a_repo") {
+          appendLog("shipper", "Deferring project identity because git could not run", {
+            failure: rootResult.failure,
+            dir: identityDir,
+            path_env: process.env.PATH || null
+          });
+          return deferredGitContext(sessionDir, rootResult.failure);
+        }
+        if (fileDir && fileDir !== identityDir) {
+          const fileRootResult = gitExecClassified(fileDir, "git rev-parse --show-toplevel");
+          if (fileRootResult.ok) {
+            const gitContext2 = buildRepoGitContext(fileRootResult.stdout);
+            saveCachedGitContext(identityDir, gitContext2);
+            return gitContext2;
+          }
+        }
+        if (!sessionDir || remote || isGuardedRoot(sessionDir)) {
+          return deferredGitContext(sessionDir, remote ? "remote_non_git" : "unnameable_dir");
+        }
+        const gitContext = {
+          workspaceFingerprint: fingerprintPath(sessionDir),
+          repoUrl: null,
+          repoFullName: null,
+          repoName: path.basename(sessionDir) || null,
+          branch: null,
+          gitRoot: null,
+          workspacePath: sessionDir,
+          resolution: "cwd",
+          resolutionFailure: null
+        };
+        saveCachedGitContext(identityDir, gitContext);
         return gitContext;
       }
       function stampPluginVersion(body) {
@@ -484,6 +570,7 @@ var require_core = __commonJS({
         appendLog,
         acquireShipperLock,
         callEdgeFunction,
+        classifyGitFailure,
         discardEnvelope,
         enqueueHookEvent,
         ensureDir,
@@ -515,9 +602,9 @@ var require_core = __commonJS({
   }
 });
 
-// packages/cursor-plugin/hooks/runtime.js
+// hooks/runtime.js
 var require_runtime = __commonJS({
-  "packages/cursor-plugin/hooks/runtime.js"(exports2, module2) {
+  "hooks/runtime.js"(exports2, module2) {
     var path = require("path");
     var { createPluginRuntime } = require_core();
     var runtime2 = createPluginRuntime({
@@ -596,53 +683,13 @@ var require_runtime = __commonJS({
       };
     }
     function resolveRepo(input, stream, gitContext) {
-      if (stream.gitBranch) {
-        return {
-          branch: stream.gitBranch,
-          repo_name: gitContext.repoName || null
-        };
+      if (gitContext.resolution === "deferred") {
+        return { branch: stream.gitBranch || null, repo_name: null };
       }
-      if (gitContext.repoName || gitContext.branch) {
-        return {
-          branch: gitContext.branch || null,
-          repo_name: gitContext.repoName || null
-        };
-      }
-      if (input.cwd) {
-        return {
-          branch: null,
-          repo_name: path.basename(input.cwd)
-        };
-      }
-      if (input.file_path) {
-        const roots = input.workspace_roots || [];
-        for (const root of roots) {
-          if (input.file_path.startsWith(root)) {
-            return {
-              branch: null,
-              repo_name: path.basename(root)
-            };
-          }
-        }
-      }
-      if (input.modified_files && input.modified_files.length > 0) {
-        const roots = input.workspace_roots || [];
-        for (const root of roots) {
-          if (input.modified_files[0].startsWith(root)) {
-            return {
-              branch: null,
-              repo_name: path.basename(root)
-            };
-          }
-        }
-      }
-      if (input.workspace_roots && input.workspace_roots.length > 0) {
-        return {
-          branch: null,
-          repo_name: path.basename(input.workspace_roots[0])
-        };
-      }
-      return { branch: null, repo_name: "unknown" };
+      return {
+        branch: stream.gitBranch || gitContext.branch || null,
+        repo_name: gitContext.repoName || null
+      };
     }
     var NON_MODEL_SENTINELS = /* @__PURE__ */ new Set(["default", "auto", "cursor-small", ""]);
     function resolveModel(input) {
@@ -818,8 +865,8 @@ var require_runtime = __commonJS({
       if (gitContext.workspaceFingerprint) {
         request.workspace_fingerprint = gitContext.workspaceFingerprint;
       }
-      if (gitContext.gitRoot) {
-        request.workspace_path = gitContext.gitRoot;
+      if (gitContext.workspacePath || gitContext.gitRoot) {
+        request.workspace_path = gitContext.workspacePath || gitContext.gitRoot;
       }
       return request;
     }
@@ -836,9 +883,9 @@ var require_runtime = __commonJS({
   }
 });
 
-// packages/plugin-runtime/status.js
+// ../plugin-runtime/status.js
 var require_status = __commonJS({
-  "packages/plugin-runtime/status.js"(exports2, module2) {
+  "../plugin-runtime/status.js"(exports2, module2) {
     var fs = require("fs");
     var path = require("path");
     function exists(filePath) {
@@ -971,7 +1018,7 @@ var require_status = __commonJS({
   }
 });
 
-// packages/cursor-plugin/hooks/status.js
+// hooks/status.js
 var runtime = require_runtime();
 var { printStatus } = require_status();
 printStatus(runtime, "Cursor");

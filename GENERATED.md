@@ -9,4 +9,4 @@ which bundles `packages/cursor-plugin/hooks` with the shared
 `packages/plugin-runtime` inlined. Edit the source in the monorepo and
 re-run the build — any changes made directly here will be overwritten.
 
-Built from plugin v1.4.3.
+Built from plugin v1.4.4.
