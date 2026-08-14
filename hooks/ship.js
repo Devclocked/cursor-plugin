@@ -155,7 +155,13 @@ var require_core = __commonJS({
         clean.tool_input = { file_path: input.tool_input.file_path };
       }
       if (input.devclocked_capture && typeof input.devclocked_capture === "object") {
-        clean.devclocked_capture = { remote: input.devclocked_capture.remote };
+        const capture = {};
+        for (const [key, value] of Object.entries(input.devclocked_capture)) {
+          if (value === null || ["string", "number", "boolean"].includes(typeof value)) {
+            capture[key] = value;
+          }
+        }
+        clean.devclocked_capture = capture;
       }
       if (Array.isArray(input.workspace_roots)) {
         clean.workspace_roots = input.workspace_roots.filter((r) => typeof r === "string");

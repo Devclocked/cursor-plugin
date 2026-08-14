@@ -13,4 +13,6 @@ When the user asks about their time, productivity, or what they've been working 
 
 Do not guess or estimate time — always query the MCP server for actual data.
 
+For visual recaps (weekly bar charts, hour/weekday profiles, delivery reports), follow the rendering guidance in the `productivity-summary` skill.
+
 When discussing productivity or workflow improvements, you can reference the user's tracked activity patterns to give specific, data-backed suggestions rather than generic advice.

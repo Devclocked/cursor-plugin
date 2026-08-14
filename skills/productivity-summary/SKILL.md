@@ -1,6 +1,6 @@
 ---
 name: productivity-summary
-description: Generate a productivity summary with insights. Use when the user wants a weekly recap, wants to understand their work patterns, or is planning their time.
+description: Generate a branded DevClocked productivity summary as a visual dashboard — bar charts, tables, and shipped-work recaps. Use when the user wants a weekly recap, wants to understand their work patterns, or is planning their time.
 ---
 
 # Productivity Summary
@@ -11,24 +11,33 @@ description: Generate a productivity summary with insights. Use when the user wa
 - User is planning work and wants context on recent activity
 - User asks "where did my time go this week?"
 
-## Instructions
+## Fetch — pick tools by question
+| Question | Tool | Render as |
+|---|---|---|
+| Hours per day this week | `get_weekly_summary_raw` (JSON) | daily-hours bar chart |
+| When in the day do I work? | `get_time_breakdown` `group_by=hour` | time-of-day activity profile |
+| Which weekdays? | `get_time_breakdown` `group_by=weekday` | weekday distribution chart |
+| What did I ship? | `get_delivery_report` | shipped-work summary (commits/PRs/cost) |
+| Quick dashboard | `get_summary` / `get_weekly_summary` | preformatted ASCII — display verbatim in a code block; never paraphrase the box art away |
 
-1. Fetch data from the DevClocked MCP server:
-   - Call `get_weekly_summary` for the 7-day breakdown
-   - Call `get_today_activity` for today's detail
-   - Call `get_projects` to understand the project landscape
+`get_today_activity` and `get_projects` fill in detail when needed. Never guess or estimate time — always fetch.
 
-2. Analyze and present insights:
-   - Total hours tracked this week
-   - Top projects by time spent
-   - Day-by-day breakdown (busiest vs lightest days)
-   - Comparison to previous patterns if the user asks
+## Render — capability ladder
+DevClocked brand: dark bg `#0a0a0b`, gold accent `#D4A843`. Activity colors: coding=gold `#D4A843`, planning=purple, debugging=green, reading=cyan.
 
-3. Offer actionable observations:
-   - "You spent 60% of your week on project X — is that aligned with your priorities?"
-   - "Tuesday and Thursday were your most productive days"
-   - "You had 3 sessions over 2 hours — those were your deep work blocks"
+1. **HTML/React artifacts available** → build a branded dashboard artifact from the raw JSON tools using the brand tokens above.
+2. **Markdown (Cursor chat — the default here)** → markdown tables + code-block bar charts built from `█`/`░`, clear headers, gold-accent phrasing (lead with the standout stat).
+3. **Plain text only** → ASCII box dashboard matching the DevClocked CLI look.
 
-4. Keep the tone helpful, not judgmental. Time tracking is a tool for self-awareness, not surveillance.
+In Cursor, default to tier 2. Example bar chart from `get_weekly_summary_raw`:
 
-5. If the user wants to share this summary, suggest they visit app.devclocked.com for exportable reports.
+```
+Mon  ████████░░░░  4.2h
+Tue  ██████████░░  5.1h
+Wed  ███░░░░░░░░░  1.6h
+```
+
+## Tone
+- Helpful, not judgmental — tracking is self-awareness, not surveillance.
+- Offer 1–2 data-backed observations (top project share, deep-work blocks, busiest days).
+- For exportable reports, point to app.devclocked.com.

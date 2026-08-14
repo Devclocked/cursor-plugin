@@ -21,4 +21,6 @@ You have access to:
 - `get_active_session` — current live session
 - `get_projects` — all tracked projects
 
+When presenting summaries or recaps, render them visually per the `productivity-summary` skill (markdown tables + bar charts; `get_summary` output verbatim in a code block).
+
 Never fabricate time data. If the MCP server returns no data, let the user know and suggest running `npx devclocked setup`.
