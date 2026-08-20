@@ -7,19 +7,47 @@ var __commonJS = (cb, mod) => function __require() {
 // ../plugin-runtime/ship.js
 var require_ship = __commonJS({
   "../plugin-runtime/ship.js"(exports2, module2) {
+    function defaultSleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+    async function acquireShipperLockWithWait(runtime2, { timeoutMs = 5e3, intervalMs = 100, sleep = defaultSleep } = {}) {
+      const deadline = Date.now() + timeoutMs;
+      let waitedMs = 0;
+      for (; ; ) {
+        const fd = runtime2.acquireShipperLock();
+        if (fd) return fd;
+        if (waitedMs >= timeoutMs || Date.now() >= deadline) return null;
+        await sleep(intervalMs);
+        waitedMs += intervalMs;
+      }
+    }
+    async function drainQueue(runtime2, processEnvelope2, { maxPasses = 25, apiKey = runtime2.loadAuth() } = {}) {
+      const attempted = /* @__PURE__ */ new Set();
+      let passes = 0;
+      let files = runtime2.listQueueFiles();
+      while (files.length > 0 && passes < maxPasses) {
+        passes += 1;
+        for (const filePath of files) {
+          attempted.add(filePath);
+          await processEnvelope2(filePath, apiKey);
+        }
+        files = runtime2.listQueueFiles().filter((filePath) => !attempted.has(filePath));
+      }
+      return { passes, attempted: attempted.size };
+    }
     async function runShipper2(runtime2, processEnvelope2) {
-      const lockFd = runtime2.acquireShipperLock();
-      if (!lockFd) process.exit(0);
+      const lockFd = await acquireShipperLockWithWait(runtime2);
+      if (!lockFd) {
+        runtime2.appendLog("shipper", "Shipper lock busy, deferring to holder");
+        process.exit(0);
+      }
       try {
         const apiKey = runtime2.loadAuth();
         if (!apiKey) {
           runtime2.appendLog("shipper", "Skipping ship pass because auth is missing");
           process.exit(0);
         }
-        const queueFiles = runtime2.listQueueFiles();
-        for (const filePath of queueFiles) {
-          await processEnvelope2(filePath, apiKey);
-        }
+        await drainQueue(runtime2, processEnvelope2, { apiKey });
         if (typeof runtime2.pruneStaleStreamState === "function") {
           const pruned = runtime2.pruneStaleStreamState();
           if (pruned > 0) {
@@ -36,6 +64,8 @@ var require_ship = __commonJS({
       process.exit(0);
     }
     module2.exports = {
+      acquireShipperLockWithWait,
+      drainQueue,
       runShipper: runShipper2
     };
   }
@@ -575,23 +605,26 @@ var require_core = __commonJS({
           return fd;
         } catch (error) {
           if (error.code !== "EEXIST") return null;
+          let reclaimable = false;
           try {
             const existing = readJsonFile2(SHIPPER_LOCK_PATH);
             const stale = !existing.started_at || Date.now() - existing.started_at > LOCK_STALE_MS;
             const dead = !existing.pid || !isProcessAlive(existing.pid);
-            if (stale || dead) {
-              fs2.unlinkSync(SHIPPER_LOCK_PATH);
-              return acquireShipperLock();
-            }
+            reclaimable = stale || dead;
           } catch {
             try {
-              fs2.unlinkSync(SHIPPER_LOCK_PATH);
-              return acquireShipperLock();
+              reclaimable = Date.now() - fs2.statSync(SHIPPER_LOCK_PATH).mtimeMs > LOCK_STALE_MS;
             } catch {
               return null;
             }
           }
-          return null;
+          if (!reclaimable) return null;
+          try {
+            fs2.unlinkSync(SHIPPER_LOCK_PATH);
+          } catch {
+            return null;
+          }
+          return acquireShipperLock();
         }
       }
       function releaseShipperLock(fd) {
@@ -1048,6 +1081,16 @@ function isLifecycleEvent(hookEvent) {
 function isActivityTypeTransition(priorState, newActivityType) {
   return Boolean(priorState?.last_activity_type) && priorState.last_activity_type !== newActivityType;
 }
+var STALE_SESSION_END_MS = 20 * 6e4;
+var DELAYED_ENVELOPE_MS = 2 * 6e4;
+function envelopeAgeMs(envelope, nowMs = Date.now()) {
+  const capturedAt = Date.parse(envelope?.captured_at);
+  if (Number.isNaN(capturedAt)) return 0;
+  return Math.max(0, nowMs - capturedAt);
+}
+function isStaleSessionEnd(hookEvent, ageMs) {
+  return hookEvent === "sessionEnd" && ageMs > STALE_SESSION_END_MS;
+}
 function initializeLifecycleState(hookEvent, stream) {
   if (hookEvent === "sessionStart") {
     saveStreamState(stream.streamId, {
@@ -1087,6 +1130,19 @@ async function processEnvelope(filePath, apiKey) {
   }
   const stream = resolveStream(hookEvent, input);
   initializeLifecycleState(hookEvent, stream);
+  const ageMs = envelopeAgeMs(envelope);
+  if (isStaleSessionEnd(hookEvent, ageMs)) {
+    removeStreamState(stream.streamId);
+    discardEnvelope(filePath, envelope, "stale_session_end");
+    return;
+  }
+  if (ageMs > DELAYED_ENVELOPE_MS) {
+    appendLog("shipper", "Shipping delayed hook event", {
+      file: path.basename(filePath),
+      hook_event_name: hookEvent,
+      age_ms: ageMs
+    });
+  }
   const throttleStateId = stream.throttleId || stream.streamId;
   if (!isLifecycleEvent(hookEvent) && shouldThrottle(throttleStateId)) {
     const priorState = getStreamState(throttleStateId);
@@ -1137,4 +1193,12 @@ async function processEnvelope(filePath, apiKey) {
 if (require.main === module) {
   runShipper(runtime, processEnvelope);
 }
-module.exports = { isActivityTypeTransition, isLifecycleEvent, processEnvelope };
+module.exports = {
+  DELAYED_ENVELOPE_MS,
+  STALE_SESSION_END_MS,
+  envelopeAgeMs,
+  isActivityTypeTransition,
+  isLifecycleEvent,
+  isStaleSessionEnd,
+  processEnvelope
+};
