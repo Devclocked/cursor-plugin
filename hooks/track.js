@@ -22,6 +22,9 @@ var require_core = __commonJS({
     var GIT_CACHE_TTL_MS = 6e4;
     var MAX_SHIP_ATTEMPTS = 5;
     var RETRY_BACKOFF_MS = 15e3;
+    var DEAD_LETTER_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1e3;
+    var DEAD_LETTER_MAX_BYTES = 5 * 1024 * 1024;
+    var DEAD_LETTER_REPLAY_LIMIT = 25;
     var PLUGIN_ACTIVITY_RETENTION_MS = 72 * 60 * 60 * 1e3;
     var MAX_PLUGIN_ACTIVITY_ENTRIES = 1e3;
     var STREAM_STATE_TTL_MS = 6 * 60 * 60 * 1e3;
@@ -46,10 +49,20 @@ var require_core = __commonJS({
     }
     function writeJsonFile(filePath, value) {
       ensureDir(path.dirname(filePath));
-      fs.writeFileSync(filePath, JSON.stringify(value, null, 2), { mode: 384 });
+      const tmpPath = `${filePath}.${process.pid}.tmp`;
       try {
-        fs.chmodSync(filePath, 384);
-      } catch {
+        fs.writeFileSync(tmpPath, JSON.stringify(value, null, 2), { mode: 384 });
+        try {
+          fs.chmodSync(tmpPath, 384);
+        } catch {
+        }
+        fs.renameSync(tmpPath, filePath);
+      } catch (error) {
+        try {
+          fs.unlinkSync(tmpPath);
+        } catch {
+        }
+        throw error;
       }
     }
     function sanitizeRepoUrl(url) {
@@ -171,6 +184,8 @@ var require_core = __commonJS({
       const QUEUE_DIR = path.join(DEVCLOCKED_HOME, `${namespace}-queue`);
       const LOG_DIR = path.join(DEVCLOCKED_HOME, `${namespace}-logs`);
       const GIT_CACHE_DIR = path.join(DEVCLOCKED_HOME, `${namespace}-cache`);
+      const DEAD_LETTER_DIR = path.join(DEVCLOCKED_HOME, `${namespace}-dead-letter`);
+      const QUARANTINE_DIR = path.join(DEVCLOCKED_HOME, `${namespace}-corrupt`);
       const SHIPPER_LOCK_PATH = path.join(QUEUE_DIR, "shipper.lock");
       const PLUGIN_ACTIVITY_PATH = path.join(PLUGIN_ACTIVITY_DIR, `${source}.json`);
       function appendLog(name, message, extra) {
@@ -593,6 +608,186 @@ var require_core = __commonJS({
         } catch {
         }
       }
+      function listDeadLetterFiles() {
+        try {
+          ensureDir(DEAD_LETTER_DIR);
+          return fs.readdirSync(DEAD_LETTER_DIR).filter((name) => name.endsWith(".json")).sort().map((name) => path.join(DEAD_LETTER_DIR, name));
+        } catch {
+          return [];
+        }
+      }
+      function deadLetterEnvelope(filePath, envelope, reason) {
+        const target = path.join(DEAD_LETTER_DIR, path.basename(filePath));
+        envelope.dead_lettered_at = (/* @__PURE__ */ new Date()).toISOString();
+        envelope.dead_letter_reason = reason;
+        try {
+          writeJsonFile(target, envelope);
+          fs.unlinkSync(filePath);
+        } catch (error) {
+          appendLog("shipper", "Failed to dead-letter queued hook event", {
+            file: path.basename(filePath),
+            reason,
+            error: error instanceof Error ? error.message : "unknown_error"
+          });
+          return null;
+        }
+        appendLog("shipper", "Dead-lettered queued hook event, will replay on reconnect", {
+          file: path.basename(filePath),
+          reason,
+          hook_event_name: envelope.input?.hook_event_name || null,
+          attempts: envelope.attempts || 0
+        });
+        return target;
+      }
+      function sweepStaleFiles(dirPath, { now, maxAgeMs, filter, reason }) {
+        let names;
+        try {
+          names = fs.readdirSync(dirPath);
+        } catch {
+          return 0;
+        }
+        let removed = 0;
+        for (const name of names) {
+          if (!filter(name)) continue;
+          const filePath = path.join(dirPath, name);
+          let stats;
+          try {
+            stats = fs.statSync(filePath);
+          } catch {
+            continue;
+          }
+          if (now - stats.mtimeMs <= maxAgeMs) continue;
+          try {
+            fs.unlinkSync(filePath);
+          } catch {
+            continue;
+          }
+          removed += 1;
+          appendLog("shipper", "Swept stale file", { file: name, dir: dirPath, reason });
+        }
+        return removed;
+      }
+      function pruneDeadLetter(now = Date.now(), options2 = {}) {
+        const maxAgeMs = options2.maxAgeMs ?? DEAD_LETTER_MAX_AGE_MS;
+        const maxBytes = options2.maxBytes ?? DEAD_LETTER_MAX_BYTES;
+        const isTmp = (name) => name.endsWith(".tmp");
+        sweepStaleFiles(QUEUE_DIR, { now, maxAgeMs, filter: isTmp, reason: "orphaned_tmp" });
+        sweepStaleFiles(DEAD_LETTER_DIR, { now, maxAgeMs, filter: isTmp, reason: "orphaned_tmp" });
+        sweepStaleFiles(QUARANTINE_DIR, { now, maxAgeMs, filter: () => true, reason: "quarantine_max_age" });
+        const entries = [];
+        for (const filePath of listDeadLetterFiles()) {
+          let stats;
+          try {
+            stats = fs.statSync(filePath);
+          } catch {
+            continue;
+          }
+          let capturedAtMs = NaN;
+          try {
+            capturedAtMs = Date.parse(readJsonFile(filePath).captured_at);
+          } catch {
+          }
+          if (!Number.isFinite(capturedAtMs)) capturedAtMs = stats.mtimeMs;
+          entries.push({ filePath, bytes: stats.size, capturedAtMs });
+        }
+        let evicted = 0;
+        const evict = (entry, reason, detail) => {
+          try {
+            fs.unlinkSync(entry.filePath);
+          } catch {
+            return false;
+          }
+          evicted += 1;
+          appendLog("shipper", "Evicted dead-lettered hook event \u2014 activity permanently lost", {
+            file: path.basename(entry.filePath),
+            reason,
+            captured_at: new Date(entry.capturedAtMs).toISOString(),
+            bytes: entry.bytes,
+            ...detail
+          });
+          return true;
+        };
+        const survivors = [];
+        for (const entry of entries) {
+          if (now - entry.capturedAtMs > maxAgeMs) {
+            if (!evict(entry, "max_age", { max_age_ms: maxAgeMs })) survivors.push(entry);
+            continue;
+          }
+          survivors.push(entry);
+        }
+        survivors.sort((a, b) => a.capturedAtMs - b.capturedAtMs);
+        let totalBytes = survivors.reduce((sum, entry) => sum + entry.bytes, 0);
+        for (const entry of survivors) {
+          if (totalBytes <= maxBytes) break;
+          if (evict(entry, "max_bytes", { max_bytes: maxBytes, total_bytes: totalBytes })) {
+            totalBytes -= entry.bytes;
+          }
+        }
+        return evicted;
+      }
+      function replayDeadLetterFile(filePath) {
+        let envelope;
+        try {
+          envelope = readJsonFile(filePath);
+        } catch (error) {
+          return { queuedPath: null, quarantined: quarantineEnvelope(filePath, error) };
+        }
+        envelope.attempts = 0;
+        delete envelope.retry_after;
+        envelope.replayed_at = (/* @__PURE__ */ new Date()).toISOString();
+        const target = path.join(QUEUE_DIR, path.basename(filePath));
+        try {
+          writeJsonFile(target, envelope);
+          fs.unlinkSync(filePath);
+        } catch (error) {
+          appendLog("shipper", "Failed to replay dead-lettered hook event", {
+            file: path.basename(filePath),
+            error: error instanceof Error ? error.message : "unknown_error"
+          });
+          return { queuedPath: null, quarantined: false };
+        }
+        return { queuedPath: target, quarantined: false };
+      }
+      function replayDeadLetter(limit = DEAD_LETTER_REPLAY_LIMIT) {
+        let replayed = 0;
+        for (const filePath of listDeadLetterFiles().slice(0, limit)) {
+          if (replayDeadLetterFile(filePath).queuedPath) replayed += 1;
+        }
+        if (replayed > 0) {
+          appendLog("shipper", "Replayed dead-lettered hook events into the queue", { count: replayed });
+        }
+        return replayed;
+      }
+      function quarantineEnvelope(filePath, error) {
+        if (!fs.existsSync(filePath)) return false;
+        try {
+          readJsonFile(filePath);
+          appendLog("shipper", "Queue file failed to process but still parses \u2014 left in place", {
+            file: path.basename(filePath),
+            error: error instanceof Error ? error.message : "unknown_error"
+          });
+          return false;
+        } catch {
+        }
+        const target = path.join(QUARANTINE_DIR, path.basename(filePath));
+        let moved = false;
+        try {
+          ensureDir(QUARANTINE_DIR);
+          fs.renameSync(filePath, target);
+          moved = true;
+        } catch {
+          try {
+            fs.unlinkSync(filePath);
+          } catch {
+          }
+        }
+        appendLog("shipper", "Quarantined unreadable queue file", {
+          file: path.basename(filePath),
+          moved_to: moved ? target : null,
+          error: error instanceof Error ? error.message : "unknown_error"
+        });
+        return moved;
+      }
       function wakeShipper() {
         try {
           const { spawn } = require("child_process");
@@ -666,27 +861,38 @@ var require_core = __commonJS({
         QUEUE_DIR,
         LOG_DIR,
         GIT_CACHE_DIR,
+        DEAD_LETTER_DIR,
+        QUARANTINE_DIR,
         SHIPPER_LOCK_PATH,
         SHIPPER_PATH: shipperPath,
         MAX_SHIP_ATTEMPTS,
+        DEAD_LETTER_MAX_AGE_MS,
+        DEAD_LETTER_MAX_BYTES,
+        DEAD_LETTER_REPLAY_LIMIT,
         appendLog,
         acquireShipperLock,
         callEdgeFunction,
         classifyGitFailure,
+        deadLetterEnvelope,
         discardEnvelope,
         enqueueHookEvent,
         ensureDir,
         firstOpaqueId,
         getStreamState,
         isTrackTickProcessed,
+        listDeadLetterFiles,
         listQueueFiles,
         loadAuth,
         markEnvelopeRetry,
         normalizeOpaqueId,
+        pruneDeadLetter,
+        quarantineEnvelope,
         readJsonFile,
         recordPluginActivity,
         releaseShipperLock,
         removeStreamState,
+        replayDeadLetter,
+        replayDeadLetterFile,
         resolveGitContext,
         saveStreamState,
         shouldRetryEnvelope,
@@ -699,6 +905,9 @@ var require_core = __commonJS({
     }
     module2.exports = {
       MAX_SHIP_ATTEMPTS,
+      DEAD_LETTER_MAX_AGE_MS,
+      DEAD_LETTER_MAX_BYTES,
+      DEAD_LETTER_REPLAY_LIMIT,
       createPluginRuntime
     };
   }
@@ -864,8 +1073,14 @@ var require_runtime = __commonJS({
           return { activity_type: "coding", sub_type: hookEvent };
       }
     }
-    function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext) {
-      const now = (/* @__PURE__ */ new Date()).toISOString();
+    function tickInstant(input, envelope) {
+      const capturedAt = Date.parse(envelope?.captured_at);
+      if (Number.isFinite(capturedAt)) return new Date(capturedAt).toISOString();
+      return (/* @__PURE__ */ new Date()).toISOString();
+    }
+    function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext, envelope) {
+      const now = tickInstant(input, envelope);
+      const requestKeyId = envelope?.id || now;
       let entity = `cursor://${hookEvent}`;
       let entityType = "window";
       let isWrite = false;
@@ -915,7 +1130,7 @@ var require_runtime = __commonJS({
       let runtimeMs = 5e3;
       if (hookEvent === "sessionEnd") {
         const priorState = runtime2.getStreamState(stream.streamId);
-        const elapsed = priorState && priorState.last_tick_at ? Date.now() - priorState.last_tick_at : null;
+        const elapsed = priorState && priorState.last_tick_at ? Date.parse(now) - priorState.last_tick_at : null;
         if (Number.isFinite(elapsed) && elapsed > 0) runtimeMs = elapsed;
       }
       const runtimeEndedAt = new Date(new Date(now).getTime() + runtimeMs).toISOString();
@@ -948,7 +1163,7 @@ var require_runtime = __commonJS({
             lines_removed_by_ai: linesDeleted || void 0,
             session_file_id: sessionFileId,
             run_id: runId,
-            request_key: `${runId}:${hookEvent}:${now}`,
+            request_key: `${runId}:${hookEvent}:${requestKeyId}`,
             runtime_ms: runtimeMs,
             runtime_started_at: now,
             runtime_ended_at: runtimeEndedAt,

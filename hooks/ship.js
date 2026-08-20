@@ -21,19 +21,76 @@ var require_ship = __commonJS({
         waitedMs += intervalMs;
       }
     }
-    async function drainQueue(runtime2, processEnvelope2, { maxPasses = 25, apiKey = runtime2.loadAuth() } = {}) {
+    function normalizeResult(value) {
+      if (value && typeof value === "object") {
+        const shipped2 = Boolean(value.shipped);
+        return {
+          shipped: shipped2,
+          reachable: value.reachable === void 0 ? shipped2 : Boolean(value.reachable),
+          failed: Boolean(value.failed)
+        };
+      }
+      const shipped = Boolean(value);
+      return { shipped, reachable: shipped, failed: false };
+    }
+    async function drainQueue(runtime2, processEnvelope2, {
+      maxPasses = 25,
+      apiKey = runtime2.loadAuth(),
+      replay = true,
+      replayLimit = 25
+    } = {}) {
       const attempted = /* @__PURE__ */ new Set();
-      let passes = 0;
+      const state = { passes: 0, shipped: 0, replayed: 0, quarantined: 0, reachable: false };
+      async function attempt(filePath) {
+        attempted.add(filePath);
+        let result;
+        try {
+          result = normalizeResult(await processEnvelope2(filePath, apiKey));
+        } catch (error) {
+          if (typeof runtime2.quarantineEnvelope === "function" && runtime2.quarantineEnvelope(filePath, error)) {
+            state.quarantined += 1;
+          }
+          runtime2.appendLog("shipper", "Queued hook event could not be processed", {
+            error: error instanceof Error ? error.message : "unknown_error"
+          });
+          return null;
+        }
+        if (result.shipped) state.shipped += 1;
+        if (result.reachable) state.reachable = true;
+        return result;
+      }
       let files = runtime2.listQueueFiles();
-      while (files.length > 0 && passes < maxPasses) {
-        passes += 1;
+      while (files.length > 0 && state.passes < maxPasses) {
+        state.passes += 1;
         for (const filePath of files) {
-          attempted.add(filePath);
-          await processEnvelope2(filePath, apiKey);
+          await attempt(filePath);
         }
         files = runtime2.listQueueFiles().filter((filePath) => !attempted.has(filePath));
       }
-      return { passes, attempted: attempted.size };
+      if (replay) {
+        if (typeof runtime2.pruneDeadLetter === "function") runtime2.pruneDeadLetter();
+        const canReplay = typeof runtime2.replayDeadLetterFile === "function" && typeof runtime2.listDeadLetterFiles === "function" && // Either the backend answered this run, or there was nothing live to ask
+        // with and the first replayed envelope becomes the probe.
+        (state.reachable || attempted.size === 0);
+        if (canReplay) {
+          for (const parkedPath of runtime2.listDeadLetterFiles().slice(0, replayLimit)) {
+            const { queuedPath, quarantined } = runtime2.replayDeadLetterFile(parkedPath);
+            if (quarantined) state.quarantined += 1;
+            if (!queuedPath) continue;
+            state.replayed += 1;
+            const result = await attempt(queuedPath);
+            if (result && result.failed) break;
+          }
+        }
+      }
+      return {
+        passes: state.passes,
+        attempted: attempted.size,
+        shipped: state.shipped,
+        replayed: state.replayed,
+        quarantined: state.quarantined,
+        reachable: state.reachable
+      };
     }
     async function runShipper2(runtime2, processEnvelope2) {
       const lockFd = await acquireShipperLockWithWait(runtime2);
@@ -47,7 +104,15 @@ var require_ship = __commonJS({
           runtime2.appendLog("shipper", "Skipping ship pass because auth is missing");
           process.exit(0);
         }
-        await drainQueue(runtime2, processEnvelope2, { apiKey });
+        const result = await drainQueue(runtime2, processEnvelope2, { apiKey });
+        if (result.replayed > 0 || result.quarantined > 0) {
+          runtime2.appendLog("shipper", "Shipper run finished", {
+            replayed: result.replayed,
+            quarantined: result.quarantined,
+            shipped: result.shipped,
+            reachable: result.reachable
+          });
+        }
         if (typeof runtime2.pruneStaleStreamState === "function") {
           const pruned = runtime2.pruneStaleStreamState();
           if (pruned > 0) {
@@ -66,6 +131,7 @@ var require_ship = __commonJS({
     module2.exports = {
       acquireShipperLockWithWait,
       drainQueue,
+      normalizeResult,
       runShipper: runShipper2
     };
   }
@@ -89,6 +155,9 @@ var require_core = __commonJS({
     var GIT_CACHE_TTL_MS = 6e4;
     var MAX_SHIP_ATTEMPTS2 = 5;
     var RETRY_BACKOFF_MS = 15e3;
+    var DEAD_LETTER_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1e3;
+    var DEAD_LETTER_MAX_BYTES = 5 * 1024 * 1024;
+    var DEAD_LETTER_REPLAY_LIMIT = 25;
     var PLUGIN_ACTIVITY_RETENTION_MS = 72 * 60 * 60 * 1e3;
     var MAX_PLUGIN_ACTIVITY_ENTRIES = 1e3;
     var STREAM_STATE_TTL_MS = 6 * 60 * 60 * 1e3;
@@ -113,10 +182,20 @@ var require_core = __commonJS({
     }
     function writeJsonFile(filePath, value) {
       ensureDir(path2.dirname(filePath));
-      fs2.writeFileSync(filePath, JSON.stringify(value, null, 2), { mode: 384 });
+      const tmpPath = `${filePath}.${process.pid}.tmp`;
       try {
-        fs2.chmodSync(filePath, 384);
-      } catch {
+        fs2.writeFileSync(tmpPath, JSON.stringify(value, null, 2), { mode: 384 });
+        try {
+          fs2.chmodSync(tmpPath, 384);
+        } catch {
+        }
+        fs2.renameSync(tmpPath, filePath);
+      } catch (error) {
+        try {
+          fs2.unlinkSync(tmpPath);
+        } catch {
+        }
+        throw error;
       }
     }
     function sanitizeRepoUrl(url) {
@@ -238,6 +317,8 @@ var require_core = __commonJS({
       const QUEUE_DIR = path2.join(DEVCLOCKED_HOME, `${namespace}-queue`);
       const LOG_DIR = path2.join(DEVCLOCKED_HOME, `${namespace}-logs`);
       const GIT_CACHE_DIR = path2.join(DEVCLOCKED_HOME, `${namespace}-cache`);
+      const DEAD_LETTER_DIR = path2.join(DEVCLOCKED_HOME, `${namespace}-dead-letter`);
+      const QUARANTINE_DIR = path2.join(DEVCLOCKED_HOME, `${namespace}-corrupt`);
       const SHIPPER_LOCK_PATH = path2.join(QUEUE_DIR, "shipper.lock");
       const PLUGIN_ACTIVITY_PATH = path2.join(PLUGIN_ACTIVITY_DIR, `${source}.json`);
       function appendLog2(name, message, extra) {
@@ -660,6 +741,186 @@ var require_core = __commonJS({
         } catch {
         }
       }
+      function listDeadLetterFiles() {
+        try {
+          ensureDir(DEAD_LETTER_DIR);
+          return fs2.readdirSync(DEAD_LETTER_DIR).filter((name) => name.endsWith(".json")).sort().map((name) => path2.join(DEAD_LETTER_DIR, name));
+        } catch {
+          return [];
+        }
+      }
+      function deadLetterEnvelope2(filePath, envelope, reason) {
+        const target = path2.join(DEAD_LETTER_DIR, path2.basename(filePath));
+        envelope.dead_lettered_at = (/* @__PURE__ */ new Date()).toISOString();
+        envelope.dead_letter_reason = reason;
+        try {
+          writeJsonFile(target, envelope);
+          fs2.unlinkSync(filePath);
+        } catch (error) {
+          appendLog2("shipper", "Failed to dead-letter queued hook event", {
+            file: path2.basename(filePath),
+            reason,
+            error: error instanceof Error ? error.message : "unknown_error"
+          });
+          return null;
+        }
+        appendLog2("shipper", "Dead-lettered queued hook event, will replay on reconnect", {
+          file: path2.basename(filePath),
+          reason,
+          hook_event_name: envelope.input?.hook_event_name || null,
+          attempts: envelope.attempts || 0
+        });
+        return target;
+      }
+      function sweepStaleFiles(dirPath, { now, maxAgeMs, filter, reason }) {
+        let names;
+        try {
+          names = fs2.readdirSync(dirPath);
+        } catch {
+          return 0;
+        }
+        let removed = 0;
+        for (const name of names) {
+          if (!filter(name)) continue;
+          const filePath = path2.join(dirPath, name);
+          let stats;
+          try {
+            stats = fs2.statSync(filePath);
+          } catch {
+            continue;
+          }
+          if (now - stats.mtimeMs <= maxAgeMs) continue;
+          try {
+            fs2.unlinkSync(filePath);
+          } catch {
+            continue;
+          }
+          removed += 1;
+          appendLog2("shipper", "Swept stale file", { file: name, dir: dirPath, reason });
+        }
+        return removed;
+      }
+      function pruneDeadLetter(now = Date.now(), options2 = {}) {
+        const maxAgeMs = options2.maxAgeMs ?? DEAD_LETTER_MAX_AGE_MS;
+        const maxBytes = options2.maxBytes ?? DEAD_LETTER_MAX_BYTES;
+        const isTmp = (name) => name.endsWith(".tmp");
+        sweepStaleFiles(QUEUE_DIR, { now, maxAgeMs, filter: isTmp, reason: "orphaned_tmp" });
+        sweepStaleFiles(DEAD_LETTER_DIR, { now, maxAgeMs, filter: isTmp, reason: "orphaned_tmp" });
+        sweepStaleFiles(QUARANTINE_DIR, { now, maxAgeMs, filter: () => true, reason: "quarantine_max_age" });
+        const entries = [];
+        for (const filePath of listDeadLetterFiles()) {
+          let stats;
+          try {
+            stats = fs2.statSync(filePath);
+          } catch {
+            continue;
+          }
+          let capturedAtMs = NaN;
+          try {
+            capturedAtMs = Date.parse(readJsonFile2(filePath).captured_at);
+          } catch {
+          }
+          if (!Number.isFinite(capturedAtMs)) capturedAtMs = stats.mtimeMs;
+          entries.push({ filePath, bytes: stats.size, capturedAtMs });
+        }
+        let evicted = 0;
+        const evict = (entry, reason, detail) => {
+          try {
+            fs2.unlinkSync(entry.filePath);
+          } catch {
+            return false;
+          }
+          evicted += 1;
+          appendLog2("shipper", "Evicted dead-lettered hook event \u2014 activity permanently lost", {
+            file: path2.basename(entry.filePath),
+            reason,
+            captured_at: new Date(entry.capturedAtMs).toISOString(),
+            bytes: entry.bytes,
+            ...detail
+          });
+          return true;
+        };
+        const survivors = [];
+        for (const entry of entries) {
+          if (now - entry.capturedAtMs > maxAgeMs) {
+            if (!evict(entry, "max_age", { max_age_ms: maxAgeMs })) survivors.push(entry);
+            continue;
+          }
+          survivors.push(entry);
+        }
+        survivors.sort((a, b) => a.capturedAtMs - b.capturedAtMs);
+        let totalBytes = survivors.reduce((sum, entry) => sum + entry.bytes, 0);
+        for (const entry of survivors) {
+          if (totalBytes <= maxBytes) break;
+          if (evict(entry, "max_bytes", { max_bytes: maxBytes, total_bytes: totalBytes })) {
+            totalBytes -= entry.bytes;
+          }
+        }
+        return evicted;
+      }
+      function replayDeadLetterFile(filePath) {
+        let envelope;
+        try {
+          envelope = readJsonFile2(filePath);
+        } catch (error) {
+          return { queuedPath: null, quarantined: quarantineEnvelope(filePath, error) };
+        }
+        envelope.attempts = 0;
+        delete envelope.retry_after;
+        envelope.replayed_at = (/* @__PURE__ */ new Date()).toISOString();
+        const target = path2.join(QUEUE_DIR, path2.basename(filePath));
+        try {
+          writeJsonFile(target, envelope);
+          fs2.unlinkSync(filePath);
+        } catch (error) {
+          appendLog2("shipper", "Failed to replay dead-lettered hook event", {
+            file: path2.basename(filePath),
+            error: error instanceof Error ? error.message : "unknown_error"
+          });
+          return { queuedPath: null, quarantined: false };
+        }
+        return { queuedPath: target, quarantined: false };
+      }
+      function replayDeadLetter(limit = DEAD_LETTER_REPLAY_LIMIT) {
+        let replayed = 0;
+        for (const filePath of listDeadLetterFiles().slice(0, limit)) {
+          if (replayDeadLetterFile(filePath).queuedPath) replayed += 1;
+        }
+        if (replayed > 0) {
+          appendLog2("shipper", "Replayed dead-lettered hook events into the queue", { count: replayed });
+        }
+        return replayed;
+      }
+      function quarantineEnvelope(filePath, error) {
+        if (!fs2.existsSync(filePath)) return false;
+        try {
+          readJsonFile2(filePath);
+          appendLog2("shipper", "Queue file failed to process but still parses \u2014 left in place", {
+            file: path2.basename(filePath),
+            error: error instanceof Error ? error.message : "unknown_error"
+          });
+          return false;
+        } catch {
+        }
+        const target = path2.join(QUARANTINE_DIR, path2.basename(filePath));
+        let moved = false;
+        try {
+          ensureDir(QUARANTINE_DIR);
+          fs2.renameSync(filePath, target);
+          moved = true;
+        } catch {
+          try {
+            fs2.unlinkSync(filePath);
+          } catch {
+          }
+        }
+        appendLog2("shipper", "Quarantined unreadable queue file", {
+          file: path2.basename(filePath),
+          moved_to: moved ? target : null,
+          error: error instanceof Error ? error.message : "unknown_error"
+        });
+        return moved;
+      }
       function wakeShipper() {
         try {
           const { spawn } = require("child_process");
@@ -733,27 +994,38 @@ var require_core = __commonJS({
         QUEUE_DIR,
         LOG_DIR,
         GIT_CACHE_DIR,
+        DEAD_LETTER_DIR,
+        QUARANTINE_DIR,
         SHIPPER_LOCK_PATH,
         SHIPPER_PATH: shipperPath,
         MAX_SHIP_ATTEMPTS: MAX_SHIP_ATTEMPTS2,
+        DEAD_LETTER_MAX_AGE_MS,
+        DEAD_LETTER_MAX_BYTES,
+        DEAD_LETTER_REPLAY_LIMIT,
         appendLog: appendLog2,
         acquireShipperLock,
         callEdgeFunction: callEdgeFunction2,
         classifyGitFailure,
+        deadLetterEnvelope: deadLetterEnvelope2,
         discardEnvelope: discardEnvelope2,
         enqueueHookEvent,
         ensureDir,
         firstOpaqueId,
         getStreamState: getStreamState2,
         isTrackTickProcessed,
+        listDeadLetterFiles,
         listQueueFiles,
         loadAuth,
         markEnvelopeRetry: markEnvelopeRetry2,
         normalizeOpaqueId,
+        pruneDeadLetter,
+        quarantineEnvelope,
         readJsonFile: readJsonFile2,
         recordPluginActivity,
         releaseShipperLock,
         removeStreamState: removeStreamState2,
+        replayDeadLetter,
+        replayDeadLetterFile,
         resolveGitContext: resolveGitContext2,
         saveStreamState: saveStreamState2,
         shouldRetryEnvelope: shouldRetryEnvelope2,
@@ -766,6 +1038,9 @@ var require_core = __commonJS({
     }
     module2.exports = {
       MAX_SHIP_ATTEMPTS: MAX_SHIP_ATTEMPTS2,
+      DEAD_LETTER_MAX_AGE_MS,
+      DEAD_LETTER_MAX_BYTES,
+      DEAD_LETTER_REPLAY_LIMIT,
       createPluginRuntime
     };
   }
@@ -931,8 +1206,14 @@ var require_runtime = __commonJS({
           return { activity_type: "coding", sub_type: hookEvent };
       }
     }
-    function buildTrackTickRequest2(hookEvent, input, stream, repo, gitContext) {
-      const now = (/* @__PURE__ */ new Date()).toISOString();
+    function tickInstant(input, envelope) {
+      const capturedAt = Date.parse(envelope?.captured_at);
+      if (Number.isFinite(capturedAt)) return new Date(capturedAt).toISOString();
+      return (/* @__PURE__ */ new Date()).toISOString();
+    }
+    function buildTrackTickRequest2(hookEvent, input, stream, repo, gitContext, envelope) {
+      const now = tickInstant(input, envelope);
+      const requestKeyId = envelope?.id || now;
       let entity = `cursor://${hookEvent}`;
       let entityType = "window";
       let isWrite = false;
@@ -982,7 +1263,7 @@ var require_runtime = __commonJS({
       let runtimeMs = 5e3;
       if (hookEvent === "sessionEnd") {
         const priorState = runtime2.getStreamState(stream.streamId);
-        const elapsed = priorState && priorState.last_tick_at ? Date.now() - priorState.last_tick_at : null;
+        const elapsed = priorState && priorState.last_tick_at ? Date.parse(now) - priorState.last_tick_at : null;
         if (Number.isFinite(elapsed) && elapsed > 0) runtimeMs = elapsed;
       }
       const runtimeEndedAt = new Date(new Date(now).getTime() + runtimeMs).toISOString();
@@ -1015,7 +1296,7 @@ var require_runtime = __commonJS({
             lines_removed_by_ai: linesDeleted || void 0,
             session_file_id: sessionFileId,
             run_id: runId,
-            request_key: `${runId}:${hookEvent}:${now}`,
+            request_key: `${runId}:${hookEvent}:${requestKeyId}`,
             runtime_ms: runtimeMs,
             runtime_started_at: now,
             runtime_ended_at: runtimeEndedAt,
@@ -1062,6 +1343,7 @@ var {
   buildTrackTickRequest,
   callEdgeFunction,
   classifyActivity,
+  deadLetterEnvelope,
   discardEnvelope,
   getStreamState,
   markEnvelopeRetry,
@@ -1088,8 +1370,17 @@ function envelopeAgeMs(envelope, nowMs = Date.now()) {
   if (Number.isNaN(capturedAt)) return 0;
   return Math.max(0, nowMs - capturedAt);
 }
+var STALE_LIFECYCLE_REASONS = {
+  sessionEnd: "stale_session_end",
+  sessionStart: "stale_session_start",
+  subagentStart: "stale_session_start"
+};
+function staleLifecycleReason(hookEvent, ageMs) {
+  if (ageMs <= STALE_SESSION_END_MS) return null;
+  return STALE_LIFECYCLE_REASONS[hookEvent] || null;
+}
 function isStaleSessionEnd(hookEvent, ageMs) {
-  return hookEvent === "sessionEnd" && ageMs > STALE_SESSION_END_MS;
+  return staleLifecycleReason(hookEvent, ageMs) === "stale_session_end";
 }
 function initializeLifecycleState(hookEvent, stream) {
   if (hookEvent === "sessionStart") {
@@ -1129,13 +1420,18 @@ async function processEnvelope(filePath, apiKey) {
     return;
   }
   const stream = resolveStream(hookEvent, input);
-  initializeLifecycleState(hookEvent, stream);
   const ageMs = envelopeAgeMs(envelope);
-  if (isStaleSessionEnd(hookEvent, ageMs)) {
+  const staleReason = staleLifecycleReason(hookEvent, ageMs);
+  if (staleReason === "stale_session_end") {
     removeStreamState(stream.streamId);
-    discardEnvelope(filePath, envelope, "stale_session_end");
+    discardEnvelope(filePath, envelope, staleReason);
     return;
   }
+  if (staleReason) {
+    discardEnvelope(filePath, envelope, staleReason);
+    return;
+  }
+  initializeLifecycleState(hookEvent, stream);
   if (ageMs > DELAYED_ENVELOPE_MS) {
     appendLog("shipper", "Shipping delayed hook event", {
       file: path.basename(filePath),
@@ -1154,7 +1450,7 @@ async function processEnvelope(filePath, apiKey) {
   }
   const gitContext = resolveGitContext(input);
   const repo = resolveRepo(input, stream, gitContext);
-  const payload = buildTrackTickRequest(hookEvent, input, stream, repo, gitContext);
+  const payload = buildTrackTickRequest(hookEvent, input, stream, repo, gitContext, envelope);
   try {
     const response = await callEdgeFunction(apiKey, "track-tick", payload);
     if (!runtime.isTrackTickProcessed(response)) {
@@ -1163,7 +1459,7 @@ async function processEnvelope(filePath, apiKey) {
         file: path.basename(filePath),
         hook_event_name: hookEvent
       });
-      return;
+      return { shipped: false, reachable: true };
     }
     if (!isLifecycleEvent(hookEvent)) {
       const state = getStreamState(throttleStateId) || {};
@@ -1175,11 +1471,15 @@ async function processEnvelope(filePath, apiKey) {
       removeStreamState(stream.streamId);
     }
     fs.unlinkSync(filePath);
+    return { shipped: true, reachable: true };
   } catch (error) {
     const message = error instanceof Error ? error.message : "unknown_error";
     if ((envelope.attempts || 0) + 1 >= MAX_SHIP_ATTEMPTS) {
-      discardEnvelope(filePath, envelope, `max_attempts:${message}`);
-      return;
+      envelope.attempts = (envelope.attempts || 0) + 1;
+      envelope.last_error = message;
+      envelope.last_attempt_at = (/* @__PURE__ */ new Date()).toISOString();
+      deadLetterEnvelope(filePath, envelope, `max_attempts:${message}`);
+      return { shipped: false, reachable: false, failed: true };
     }
     markEnvelopeRetry(filePath, envelope, message);
     appendLog("shipper", "Queued hook event failed to send", {
@@ -1188,6 +1488,7 @@ async function processEnvelope(filePath, apiKey) {
       attempts: (envelope.attempts || 0) + 1,
       error: message
     });
+    return { shipped: false, reachable: false, failed: true };
   }
 }
 if (require.main === module) {
@@ -1200,5 +1501,6 @@ module.exports = {
   isActivityTypeTransition,
   isLifecycleEvent,
   isStaleSessionEnd,
-  processEnvelope
+  processEnvelope,
+  staleLifecycleReason
 };
